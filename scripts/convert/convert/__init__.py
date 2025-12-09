@@ -1,4 +1,4 @@
-"""Convert Jina BERT v2 to CoreML format for ANE acceleration."""
+"""Convert Jina ColBERT v2 to CoreML format for ANE acceleration."""
 
 import argparse
 from pathlib import Path
@@ -6,7 +6,7 @@ from pathlib import Path
 import coremltools as ct
 import numpy as np
 import torch
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer, AutoConfig
 
 
 class JinaBertEncoder(torch.nn.Module):
@@ -28,16 +28,22 @@ def convert_to_coreml(
     output_path: Path,
     max_seq_length: int = 512,
 ) -> None:
-    """Convert a Jina BERT model to CoreML format.
+    """Convert a Jina ColBERT model to CoreML format.
 
     Args:
-        model_name: HuggingFace model name (e.g., "jinaai/jina-bert-v2-qk-post-norm")
+        model_name: HuggingFace model name (e.g., "jinaai/jina-colbert-v2")
         output_path: Path to save the .mlpackage
         max_seq_length: Maximum sequence length for the model
     """
     print(f"Loading model: {model_name}")
+
+    # Load config and disable flash attention (not available without CUDA)
+    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    if hasattr(config, "use_flash_attn"):
+        config.use_flash_attn = False
+
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+    model = AutoModel.from_pretrained(model_name, config=config, trust_remote_code=True)
     model.eval()
 
     encoder = JinaBertEncoder(model)
@@ -99,13 +105,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--model",
-        default="jinaai/jina-bert-v2-qk-post-norm",
+        default="jinaai/jina-colbert-v2",
         help="HuggingFace model name",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("models/jina-bert-v2.mlpackage"),
+        default=Path("models/jina-colbert-v2.mlpackage"),
         help="Output path for the CoreML model",
     )
     parser.add_argument(
