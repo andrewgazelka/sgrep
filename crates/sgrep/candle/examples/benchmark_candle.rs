@@ -41,7 +41,7 @@ fn benchmark_device(
     tracing::info!(%device_name, "warming up ({WARMUP_ITERATIONS} iterations)");
     for _ in 0..WARMUP_ITERATIONS {
         for text in TEST_TEXTS {
-            let _ = encoder.encode(text)?;
+            let _ = encoder.encode_document(text)?;
         }
     }
 
@@ -52,7 +52,7 @@ fn benchmark_device(
     for _ in 0..BENCHMARK_ITERATIONS {
         for text in TEST_TEXTS {
             let start = std::time::Instant::now();
-            let _ = encoder.encode(text)?;
+            let _ = encoder.encode_document(text)?;
             latencies.push(start.elapsed().as_secs_f64() * 1000.0); // ms
         }
     }

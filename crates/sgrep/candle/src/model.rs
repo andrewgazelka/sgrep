@@ -1,11 +1,11 @@
 //! Jina ColBERT v2 model implementation with Rotary Position Embeddings (RoPE).
 //!
-//! This is an XLM-RoBERTa variant with RoPE, flash attention style, and pre-norm.
+//! This is an XLM-RoBERTa variant with RoPE and flash attention style.
 //! Weight naming follows the HuggingFace jina-colbert-v2 format.
 //!
 //! # Architecture
 //!
-//! - 24 transformer layers with pre-norm (norm before attention/mlp)
+//! - 24 transformer layers with post-norm (norm after residual add)
 //! - Combined Q/K/V projection (`Wqkv`) instead of separate projections
 //! - Rotary Position Embeddings (RoPE) instead of absolute position embeddings
 //! - Output projection to 128 dimensions for ColBERT late interaction
@@ -270,7 +270,13 @@ impl MLP {
     }
 }
 
-/// Transformer layer with pre-norm (norm before attention/mlp).
+/// Transformer layer with post-norm (norm after residual add).
+///
+/// Post-norm architecture:
+/// 1. attn_out = mixer(hidden_states)
+/// 2. hidden_states = norm1(hidden_states + attn_out)
+/// 3. mlp_out = mlp(hidden_states)
+/// 4. hidden_states = norm2(hidden_states + mlp_out)
 struct TransformerLayer {
     norm1: LayerNorm,
     mixer: SelfAttention,
@@ -293,15 +299,13 @@ impl TransformerLayer {
     }
 
     fn forward(&self, hidden_states: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
-        // Pre-norm attention with residual
-        let normed = self.norm1.forward(hidden_states)?;
-        let attn_output = self.mixer.forward(&normed, attention_mask)?;
-        let hidden_states = (hidden_states + attn_output)?;
+        // Post-norm attention: mixer -> residual add -> norm
+        let attn_output = self.mixer.forward(hidden_states, attention_mask)?;
+        let hidden_states = self.norm1.forward(&(hidden_states + attn_output)?)?;
 
-        // Pre-norm MLP with residual
-        let normed = self.norm2.forward(&hidden_states)?;
-        let mlp_output = self.mlp.forward(&normed)?;
-        let hidden_states = (hidden_states + mlp_output)?;
+        // Post-norm MLP: mlp -> residual add -> norm
+        let mlp_output = self.mlp.forward(&hidden_states)?;
+        let hidden_states = self.norm2.forward(&(hidden_states + mlp_output)?)?;
 
         Ok(hidden_states)
     }
