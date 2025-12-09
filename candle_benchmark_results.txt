@@ -1,0 +1,12 @@
+Candle Benchmark Results
+========================
+
+Configuration: 3 warmup, 20 iterations, 5 texts
+
+Provider                Mean (ms)     P50 (ms)
+-------------------- ------------ ------------
+Candle-CPU                 465.33       456.52
+Candle-Metal                71.06        70.07
+
+Speedup vs Candle-CPU:
+  Candle-Metal: 6.55x
