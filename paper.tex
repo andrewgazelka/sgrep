@@ -1,0 +1,219 @@
+\documentclass{article}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+
+\title{Hybrid Retrieval with Late Interaction Reranking}
+\author{sgrep: Semantic Grep}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We describe two approaches to hybrid retrieval that combine lexical (BM25) and neural methods: (1) cross-encoder reranking, which is slow but maximally accurate, and (2) ColBERT late interaction reranking, which provides a practical tradeoff between speed and semantic understanding. The \texttt{sgrep} tool implements the latter approach.
+\end{abstract}
+
+\section{Background: The Retrieval Pipeline}
+
+Modern search systems typically use a two-stage pipeline:
+
+\begin{enumerate}
+    \item \textbf{Retrieval}: Fast, approximate candidate generation (high recall)
+    \item \textbf{Reranking}: Slow, precise scoring of candidates (high precision)
+\end{enumerate}
+
+BM25 excels at retrieval—it's fast, requires no training, and captures lexical overlap. However, it misses semantic similarity (``compute similarity'' won't match ``calculate distance''). Neural methods capture semantics but are computationally expensive.
+
+\section{Approach 1: Cross-Encoder Reranking}
+
+\subsection{Architecture}
+
+A cross-encoder jointly encodes the query and document:
+
+\begin{equation}
+    \text{score}(q, d) = \text{MLP}(\text{BERT}([q; \text{SEP}; d]))
+\end{equation}
+
+where $[q; \text{SEP}; d]$ denotes concatenation with a separator token. The model sees full interaction between query and document tokens through self-attention.
+
+\subsection{Pipeline}
+
+\begin{algorithm}
+\caption{Cross-Encoder Reranking}
+\begin{algorithmic}[1]
+\State $\mathcal{C} \gets \text{BM25}(q, k=100)$ \Comment{Retrieve candidates}
+\For{$d \in \mathcal{C}$}
+    \State $\text{score}[d] \gets \text{CrossEncoder}(q, d)$ \Comment{$O(|q| \cdot |d|)$ per doc}
+\EndFor
+\State \Return $\text{TopK}(\text{score}, n)$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Complexity}
+
+For each query-document pair, the cross-encoder runs full transformer inference:
+\begin{itemize}
+    \item Time: $O(k \cdot L^2 \cdot H)$ where $k$ = candidates, $L$ = sequence length, $H$ = hidden dim
+    \item Cannot precompute document representations
+    \item Typical latency: 100-500ms for 100 candidates
+\end{itemize}
+
+\subsection{Accuracy}
+
+Cross-encoders achieve state-of-the-art accuracy because:
+\begin{itemize}
+    \item Full token-level interaction between query and document
+    \item Can learn complex relevance patterns
+    \item No information bottleneck (unlike bi-encoders)
+\end{itemize}
+
+\section{Approach 2: ColBERT Late Interaction}
+
+\subsection{Architecture}
+
+ColBERT~\cite{colbert} uses a bi-encoder with \emph{late interaction}:
+
+\begin{equation}
+    E_q = \text{normalize}(\text{Linear}(\text{BERT}(q))) \in \mathbb{R}^{|q| \times d}
+\end{equation}
+\begin{equation}
+    E_d = \text{normalize}(\text{Linear}(\text{BERT}(d))) \in \mathbb{R}^{|d| \times d}
+\end{equation}
+
+where each token gets its own embedding vector (not pooled).
+
+\subsection{MaxSim Scoring}
+
+The relevance score uses Maximum Similarity (MaxSim):
+
+\begin{equation}
+    \text{MaxSim}(q, d) = \sum_{i=1}^{|q|} \max_{j=1}^{|d|} E_q[i] \cdot E_d[j]
+\end{equation}
+
+For each query token, find the most similar document token, then sum.
+
+\subsection{Pipeline}
+
+\begin{algorithm}
+\caption{ColBERT Reranking (sgrep approach)}
+\begin{algorithmic}[1]
+\State \textbf{Index time:}
+\For{$d \in \mathcal{D}$}
+    \State $E_d \gets \text{ColBERT}(d)$ \Comment{Precompute \& store}
+    \State $\text{BM25Index.add}(d)$
+\EndFor
+\State
+\State \textbf{Query time:}
+\State $\mathcal{C} \gets \text{BM25}(q, k=30)$ \Comment{Retrieve candidates}
+\State $E_q \gets \text{ColBERT}(q)$ \Comment{Encode query once}
+\For{$d \in \mathcal{C}$}
+    \State $E_d \gets \text{LoadEmbedding}(d)$ \Comment{From disk/cache}
+    \State $\text{score}[d] \gets \text{MaxSim}(E_q, E_d)$
+\EndFor
+\State $\text{fused} \gets \text{RRF}(\text{BM25\_ranks}, \text{ColBERT\_ranks})$
+\State \Return $\text{TopK}(\text{fused}, n)$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Complexity}
+
+\begin{itemize}
+    \item Index time: $O(|\mathcal{D}| \cdot L^2 \cdot H)$ — one-time cost
+    \item Query time: $O(L^2 \cdot H + k \cdot |q| \cdot |d| \cdot d)$
+    \item The $k \cdot |q| \cdot |d| \cdot d$ term is just dot products (very fast)
+    \item Typical latency: 50-100ms for 30 candidates on GPU
+\end{itemize}
+
+\subsection{Why Late Interaction Works}
+
+Unlike single-vector bi-encoders that compress documents to one vector (information bottleneck), ColBERT preserves token-level semantics:
+
+\begin{itemize}
+    \item Query ``error handling'' matches document tokens ``exception'', ``catch'', ``throw''
+    \item Each query token finds its best match independently
+    \item Captures soft term matching without full cross-attention
+\end{itemize}
+
+\section{Fusion: Reciprocal Rank Fusion}
+
+Given ranked lists from BM25 and ColBERT, we combine using RRF~\cite{rrf}:
+
+\begin{equation}
+    \text{RRF}(d) = \sum_{r \in \text{rankers}} \frac{1}{k + \text{rank}_r(d)}
+\end{equation}
+
+where $k=60$ is a constant that controls the influence of high-ranked documents.
+
+\subsection{Why RRF?}
+
+\begin{itemize}
+    \item \textbf{Score-agnostic}: BM25 scores and ColBERT scores are on different scales
+    \item \textbf{No tuning}: Works well without learning weights
+    \item \textbf{Robust}: A document ranked highly by either method surfaces
+\end{itemize}
+
+\section{Comparison}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lccc}
+\toprule
+\textbf{Method} & \textbf{Index Time} & \textbf{Query Time} & \textbf{Accuracy} \\
+\midrule
+BM25 only & Fast & Fast & Baseline \\
+Cross-encoder rerank & Fast & Slow & Best \\
+ColBERT rerank (sgrep) & Slow & Medium & Good \\
+\bottomrule
+\end{tabular}
+\caption{Tradeoffs between retrieval approaches}
+\end{table}
+
+\section{sgrep Implementation}
+
+The \texttt{sgrep} tool implements ColBERT reranking:
+
+\begin{verbatim}
+# Index: BM25 + ColBERT embeddings
+sgrep index /path/to/code
+
+# Search: Fused BM25 + ColBERT
+sgrep search "error handling"
+
+# View all scores
+sgrep search "error handling" --json
+\end{verbatim}
+
+Key implementation details:
+\begin{itemize}
+    \item Model: Jina-ColBERT-v2 (multilingual, 128-dim embeddings)
+    \item BM25: Tantivy with code-aware tokenization
+    \item Storage: Content-addressed (blake3 hash) for deduplication
+    \item Fusion: RRF with $k=60$
+\end{itemize}
+
+\section{Future Work}
+
+\begin{itemize}
+    \item \textbf{Learned fusion weights}: Train on code search benchmarks
+    \item \textbf{Query expansion}: Use LLM to expand queries
+    \item \textbf{Chunking}: Split large files for finer-grained retrieval
+    \item \textbf{Cross-encoder option}: Add slow-but-accurate mode
+\end{itemize}
+
+\begin{thebibliography}{9}
+\bibitem{colbert}
+Khattab, O., \& Zaharia, M. (2020). ColBERT: Efficient and Effective Passage Search via Contextualized Late Interaction over BERT. \textit{SIGIR}.
+
+\bibitem{rrf}
+Cormack, G. V., Clarke, C. L., \& Buettcher, S. (2009). Reciprocal rank fusion outperforms condorcet and individual rank learning methods. \textit{SIGIR}.
+
+\bibitem{jina-colbert}
+Günther, M., et al. (2024). Jina-ColBERT-v2: A General-Purpose Multilingual Late Interaction Retriever. \textit{MRL Workshop}.
+\end{thebibliography}
+
+\end{document}

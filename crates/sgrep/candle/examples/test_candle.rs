@@ -40,7 +40,11 @@ fn main() -> eyre::Result<()> {
 
         // Print first few values of first token embedding
         if let Some(first_emb) = embedding.embeddings.first() {
-            let preview: Vec<_> = first_emb.iter().take(5).map(|v| format!("{v:.4}")).collect();
+            let preview: Vec<_> = first_emb
+                .iter()
+                .take(5)
+                .map(|v| format!("{v:.4}"))
+                .collect();
             tracing::info!(?preview, "First token embedding (first 5 values)");
         }
     }

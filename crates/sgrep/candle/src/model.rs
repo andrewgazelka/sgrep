@@ -240,9 +240,11 @@ impl SelfAttention {
         let attn_output = attn_weights.matmul(&v)?;
 
         // Reshape back to [batch, seq, hidden]
-        let attn_output = attn_output
-            .transpose(1, 2)?
-            .reshape((batch_size, seq_len, self.num_heads * self.head_dim))?;
+        let attn_output = attn_output.transpose(1, 2)?.reshape((
+            batch_size,
+            seq_len,
+            self.num_heads * self.head_dim,
+        ))?;
 
         // Output projection
         self.out_proj.forward(&attn_output)
@@ -368,13 +370,13 @@ impl JinaColBert {
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for i in 0..config.num_hidden_layers {
-            let layer =
-                TransformerLayer::new(config, roberta_vb.pp("encoder").pp("layers").pp(i))?;
+            let layer = TransformerLayer::new(config, roberta_vb.pp("encoder").pp("layers").pp(i))?;
             layers.push(layer);
         }
 
         // ColBERT projection layer (hidden_size -> OUTPUT_DIM, no bias)
-        let linear = candle_nn::linear_no_bias(config.hidden_size, Self::OUTPUT_DIM, vb.pp("linear"))?;
+        let linear =
+            candle_nn::linear_no_bias(config.hidden_size, Self::OUTPUT_DIM, vb.pp("linear"))?;
 
         Ok(Self {
             embeddings,

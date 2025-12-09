@@ -29,7 +29,11 @@ pub fn reciprocal_rank_fusion(
         .collect();
 
     // Sort by score descending
-    fused.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    fused.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     fused
 }
@@ -80,7 +84,11 @@ pub fn linear_combination(
         .map(|(doc_id, score)| sgrep_core::SearchResult { doc_id, score })
         .collect();
 
-    fused.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    fused.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     fused
 }

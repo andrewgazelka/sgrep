@@ -5,11 +5,11 @@
 //! execution provider for ANE (Apple Neural Engine) acceleration.
 
 use eyre::WrapErr as _;
+use ort::execution_providers::ExecutionProvider as _;
 use ort::execution_providers::coreml::{
     CoreMLComputeUnits, CoreMLExecutionProvider, CoreMLModelFormat,
 };
-use ort::execution_providers::ExecutionProvider as _;
-use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::session::{Session, builder::GraphOptimizationLevel};
 
 const HIDDEN_DIM: usize = 1024;
 const MAX_SEQ_LENGTH: usize = 128;
@@ -163,11 +163,9 @@ impl ColBertEncoder {
         }
 
         // Create input tensors using ort::value::Tensor
-        let input_ids_tensor = ort::value::Tensor::from_array((
-            vec![1, MAX_SEQ_LENGTH],
-            input_ids.into_boxed_slice(),
-        ))
-        .wrap_err("failed to create input_ids tensor")?;
+        let input_ids_tensor =
+            ort::value::Tensor::from_array((vec![1, MAX_SEQ_LENGTH], input_ids.into_boxed_slice()))
+                .wrap_err("failed to create input_ids tensor")?;
 
         let attention_mask_tensor = ort::value::Tensor::from_array((
             vec![1, MAX_SEQ_LENGTH],
@@ -206,7 +204,10 @@ impl ColBertEncoder {
     }
 
     /// Encode multiple texts in a batch (more efficient than encoding one by one).
-    pub fn encode_batch(&mut self, texts: &[&str]) -> eyre::Result<Vec<sgrep_core::DocumentEmbedding>> {
+    pub fn encode_batch(
+        &mut self,
+        texts: &[&str],
+    ) -> eyre::Result<Vec<sgrep_core::DocumentEmbedding>> {
         // For now, just encode sequentially. Batch inference can be added later.
         texts.iter().map(|text| self.encode(text)).collect()
     }

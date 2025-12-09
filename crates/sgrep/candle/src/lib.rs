@@ -49,12 +49,7 @@ impl ColBertEncoder {
         tokenizer_path: impl AsRef<std::path::Path>,
         config_path: impl AsRef<std::path::Path>,
     ) -> eyre::Result<Self> {
-        Self::load_with_device(
-            model_path,
-            tokenizer_path,
-            config_path,
-            default_device()?,
-        )
+        Self::load_with_device(model_path, tokenizer_path, config_path, default_device()?)
     }
 
     /// Load a ColBERT encoder with a specific device.
@@ -89,8 +84,7 @@ impl ColBertEncoder {
         };
 
         // Build model
-        let model = model::JinaColBert::new(&config, vb)
-            .wrap_err("failed to build model")?;
+        let model = model::JinaColBert::new(&config, vb).wrap_err("failed to build model")?;
 
         // Load tokenizer
         tracing::info!(?tokenizer_path, "loading tokenizer");
@@ -166,7 +160,9 @@ impl ColBertEncoder {
         let output = output
             .to_dtype(candle_core::DType::F32)
             .wrap_err("failed to convert output to f32")?;
-        let output = output.to_vec3::<f32>().wrap_err("failed to convert output to vec")?;
+        let output = output
+            .to_vec3::<f32>()
+            .wrap_err("failed to convert output to vec")?;
 
         // Only take actual tokens (not padding) and L2 normalize each embedding
         let embeddings: Vec<Vec<f32>> = output

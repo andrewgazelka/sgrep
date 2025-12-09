@@ -124,12 +124,12 @@ fn main() -> eyre::Result<()> {
 
     println!("  Query: \"http request api call\"");
     for (score, desc, code) in &scores {
-        let marker =
-            if desc.contains("fetch") || desc.contains("HTTP") || desc.contains("requests") {
-                "✓"
-            } else {
-                " "
-            };
+        let marker = if desc.contains("fetch") || desc.contains("HTTP") || desc.contains("requests")
+        {
+            "✓"
+        } else {
+            " "
+        };
         println!("  {marker} {score:.3} [{desc}] {code}");
     }
 
@@ -156,12 +156,12 @@ fn main() -> eyre::Result<()> {
 
     println!("  Query: \"async await concurrent\"");
     for (score, desc, code) in &scores {
-        let marker = if desc.contains("async") || desc.contains("Promise") || desc.contains("goroutine")
-        {
-            "✓"
-        } else {
-            " "
-        };
+        let marker =
+            if desc.contains("async") || desc.contains("Promise") || desc.contains("goroutine") {
+                "✓"
+            } else {
+                " "
+            };
         println!("  {marker} {score:.3} [{desc}] {code}");
     }
 

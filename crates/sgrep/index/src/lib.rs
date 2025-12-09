@@ -17,10 +17,8 @@ impl Bm25Index {
         let mut schema_builder = tantivy::schema::Schema::builder();
 
         // Path field - stored but not indexed for search
-        let path_field = schema_builder.add_text_field(
-            "path",
-            tantivy::schema::TextOptions::default().set_stored(),
-        );
+        let path_field = schema_builder
+            .add_text_field("path", tantivy::schema::TextOptions::default().set_stored());
 
         // Content field - indexed with custom tokenizer for code
         let text_options = tantivy::schema::TextOptions::default()
@@ -54,10 +52,8 @@ impl Bm25Index {
 
         let mut schema_builder = tantivy::schema::Schema::builder();
 
-        let path_field = schema_builder.add_text_field(
-            "path",
-            tantivy::schema::TextOptions::default().set_stored(),
-        );
+        let path_field = schema_builder
+            .add_text_field("path", tantivy::schema::TextOptions::default().set_stored());
 
         let text_options = tantivy::schema::TextOptions::default()
             .set_indexing_options(
@@ -96,7 +92,9 @@ impl Bm25Index {
         doc.add_text(self.path_field, path);
         doc.add_text(self.content_field, content);
 
-        writer.add_document(doc).wrap_err("failed to add document")?;
+        writer
+            .add_document(doc)
+            .wrap_err("failed to add document")?;
         writer.commit().wrap_err("failed to commit")?;
 
         Ok(())

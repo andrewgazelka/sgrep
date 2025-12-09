@@ -46,9 +46,9 @@ mod tests {
         // Query token should find its best match among document tokens
         let query = vec![vec![1.0, 0.0]];
         let doc = vec![
-            vec![0.5, 0.0],  // similarity = 0.5
-            vec![0.9, 0.0],  // similarity = 0.9 (best)
-            vec![0.1, 0.0],  // similarity = 0.1
+            vec![0.5, 0.0], // similarity = 0.5
+            vec![0.9, 0.0], // similarity = 0.9 (best)
+            vec![0.1, 0.0], // similarity = 0.1
         ];
         let score = compute_maxsim(&query, &doc);
         assert!((score - 0.9).abs() < 1e-6);

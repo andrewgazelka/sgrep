@@ -138,7 +138,9 @@ impl CasStore {
 
         let mut buf4 = [0u8; 4];
 
-        reader.read_exact(&mut buf4).wrap_err("failed to read dim")?;
+        reader
+            .read_exact(&mut buf4)
+            .wrap_err("failed to read dim")?;
         let dim = u32::from_le_bytes(buf4) as usize;
 
         reader
@@ -237,10 +239,8 @@ mod tests {
         let hash = store.store_content(content).unwrap();
         assert!(store.has_content(&hash));
 
-        let embedding = sgrep_core::DocumentEmbedding::new(
-            vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]],
-            3,
-        );
+        let embedding =
+            sgrep_core::DocumentEmbedding::new(vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]], 3);
         store.store_embeddings(&hash, &embedding).unwrap();
         assert!(store.has_embeddings(&hash));
 

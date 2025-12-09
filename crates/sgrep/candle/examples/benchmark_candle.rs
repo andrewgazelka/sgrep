@@ -125,8 +125,7 @@ fn main() -> eyre::Result<()> {
 
     // Write results to file
     let output_path = "candle_benchmark_results.txt";
-    let mut file =
-        std::fs::File::create(output_path).wrap_err("failed to create results file")?;
+    let mut file = std::fs::File::create(output_path).wrap_err("failed to create results file")?;
 
     writeln!(file, "Candle Benchmark Results")?;
     writeln!(file, "========================")?;
@@ -137,7 +136,11 @@ fn main() -> eyre::Result<()> {
         TEST_TEXTS.len()
     )?;
     writeln!(file)?;
-    writeln!(file, "{:<20} {:>12} {:>12}", "Provider", "Mean (ms)", "P50 (ms)")?;
+    writeln!(
+        file,
+        "{:<20} {:>12} {:>12}",
+        "Provider", "Mean (ms)", "P50 (ms)"
+    )?;
     writeln!(file, "{:-<20} {:->12} {:->12}", "", "", "")?;
 
     for (name, mean, p50) in &results {
