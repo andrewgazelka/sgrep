@@ -3,6 +3,9 @@
 //! This crate provides a wrapper around ONNX Runtime to run the Jina ColBERT
 //! model for generating per-token embeddings. On macOS, it uses the CoreML
 //! execution provider for ANE (Apple Neural Engine) acceleration.
+//!
+//! NOTE: The Candle-based encoder (`sgrep-candle`) is preferred for better
+//! Apple Silicon performance via Metal.
 
 use eyre::WrapErr as _;
 use ort::execution_providers::ExecutionProvider as _;
@@ -132,20 +135,23 @@ impl ColBertEncoder {
 
         let session = builder
             .commit_from_file(model_path)
-            .wrap_err_with(|| format!("failed to load ONNX model from {model_path:?}"))?;
+            .wrap_err_with(|| format!("failed to load ONNX model from {}", model_path.display()))?;
 
-        tracing::info!(?tokenizer_path, "loading tokenizer");
+        tracing::info!(tokenizer_path = %tokenizer_path.display(), "loading tokenizer");
 
         let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
-            .map_err(|e| eyre::eyre!("failed to load tokenizer from {tokenizer_path:?}: {e}"))?;
+            .map_err(|e| eyre::eyre!("failed to load tokenizer from {}: {e}", tokenizer_path.display()))?;
 
         Ok(Self { session, tokenizer })
     }
 
     /// Encode text into a document embedding (per-token embeddings).
     ///
-    /// Returns a `DocumentEmbedding` containing one embedding vector per token.
-    pub fn encode(&mut self, text: &str) -> eyre::Result<sgrep_core::DocumentEmbedding> {
+    /// Returns an ndarray with shape [num_tokens, HIDDEN_DIM].
+    ///
+    /// NOTE: This produces 1024-dim embeddings (raw transformer output).
+    /// The Candle encoder produces 128-dim ColBERT embeddings after projection.
+    pub fn encode(&mut self, text: &str) -> eyre::Result<ndarray::Array2<f32>> {
         let encoding = self
             .tokenizer
             .encode(text, true)
@@ -191,23 +197,19 @@ impl ColBertEncoder {
             .try_extract_array::<f32>()
             .wrap_err("failed to extract output tensor")?;
 
-        // Convert to Vec<Vec<f32>> - only take actual tokens (not padding)
-        let embeddings: Vec<Vec<f32>> = (0..token_count)
-            .map(|i| {
-                (0..HIDDEN_DIM)
-                    .map(|j| *output_array.get([0, i, j]).unwrap_or(&0.0))
-                    .collect()
-            })
-            .collect();
+        // Create ndarray with shape [token_count, HIDDEN_DIM]
+        let mut embedding = ndarray::Array2::zeros((token_count, HIDDEN_DIM));
+        for i in 0..token_count {
+            for j in 0..HIDDEN_DIM {
+                embedding[[i, j]] = *output_array.get([0, i, j]).unwrap_or(&0.0);
+            }
+        }
 
-        Ok(sgrep_core::DocumentEmbedding::new(embeddings, HIDDEN_DIM))
+        Ok(embedding)
     }
 
     /// Encode multiple texts in a batch (more efficient than encoding one by one).
-    pub fn encode_batch(
-        &mut self,
-        texts: &[&str],
-    ) -> eyre::Result<Vec<sgrep_core::DocumentEmbedding>> {
+    pub fn encode_batch(&mut self, texts: &[&str]) -> eyre::Result<Vec<ndarray::Array2<f32>>> {
         // For now, just encode sequentially. Batch inference can be added later.
         texts.iter().map(|text| self.encode(text)).collect()
     }
@@ -229,7 +231,7 @@ mod tests {
 
         let embedding = encoder.encode("Hello, world!").expect("encoding failed");
 
-        assert!(!embedding.embeddings.is_empty());
-        assert_eq!(embedding.dim, super::HIDDEN_DIM);
+        assert!(!embedding.is_empty());
+        assert_eq!(embedding.shape()[1], super::HIDDEN_DIM);
     }
 }

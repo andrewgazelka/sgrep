@@ -1,5 +1,7 @@
 # sgrep - Semantic Grep
 
+Made for macOS
+We designing M-series chips
 Semantic code search using ColBERT-style late interaction.
 
 ## Model

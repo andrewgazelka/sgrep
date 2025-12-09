@@ -10,7 +10,7 @@ use eyre::WrapErr as _;
 
 const MODEL_REPO: &str = "jinaai/jina-colbert-v2";
 const BM25_DIR: &str = "bm25";
-const CAS_DIR: &str = "cas";
+const EMBEDDINGS_DIR: &str = "embeddings";
 const INDEX_DIR: &str = ".sgrep";
 
 fn main() -> eyre::Result<()> {
@@ -109,7 +109,7 @@ fn load_encoder() -> eyre::Result<sgrep_candle::ColBertEncoder> {
 
 /// Build a mapping from doc_id to content hash for semantic search.
 fn build_doc_hash_map(
-    cas: &sgrep_cas::CasStore,
+    store: &sgrep_cas::EmbeddingStore,
     path: &std::path::Path,
 ) -> eyre::Result<std::collections::HashMap<String, sgrep_cas::ContentHash>> {
     let mut map = std::collections::HashMap::new();
@@ -135,7 +135,7 @@ fn build_doc_hash_map(
         };
 
         let hash = sgrep_cas::ContentHash::from_content(&content);
-        if cas.has_embeddings(&hash) {
+        if store.has_embeddings(&hash) {
             let relative_path = file_path
                 .strip_prefix(path)
                 .unwrap_or(file_path)
@@ -215,11 +215,12 @@ fn search(
     }
 
     // Semantic search with ColBERT
-    let cas_path = index_path.join(CAS_DIR);
-    let cas = sgrep_cas::CasStore::new(cas_path).wrap_err("failed to open CAS store")?;
+    let embeddings_path = index_path.join(EMBEDDINGS_DIR);
+    let mut store = sgrep_cas::EmbeddingStore::open(embeddings_path)
+        .wrap_err("failed to open embedding store")?;
 
     // Build doc_id -> hash mapping
-    let doc_hash_map = build_doc_hash_map(&cas, path).wrap_err("failed to build doc hash map")?;
+    let doc_hash_map = build_doc_hash_map(&store, path).wrap_err("failed to build doc hash map")?;
 
     if doc_hash_map.is_empty() {
         // No embeddings, fall back to BM25 only
@@ -253,31 +254,49 @@ fn search(
         .encode_query(query)
         .wrap_err("failed to encode query")?;
 
-    // Compute MaxSim scores for BM25 candidates
-    let mut semantic_results = Vec::new();
-    let mut colbert_scores: std::collections::HashMap<String, f32> =
-        std::collections::HashMap::new();
+    // Collect document embeddings for batch processing
+    let mut doc_ids = Vec::new();
+    let mut doc_hashes = Vec::new();
 
     for bm25_result in &bm25_results {
-        let Some(hash) = doc_hash_map.get(&bm25_result.doc_id) else {
-            continue;
-        };
+        if let Some(hash) = doc_hash_map.get(&bm25_result.doc_id) {
+            doc_ids.push(bm25_result.doc_id.clone());
+            doc_hashes.push(hash);
+        }
+    }
 
-        let Some(doc_embedding) = cas
-            .load_embeddings(hash)
-            .wrap_err("failed to load embeddings")?
-        else {
-            continue;
-        };
+    // Get batch views and compute MaxSim scores on GPU
+    let gpu = sgrep_embed::GpuDevice::new().wrap_err("failed to create GPU device")?;
 
-        let score = sgrep_embed::maxsim(&query_embedding, &doc_embedding)
-            .wrap_err("failed to compute MaxSim")?;
+    let batch_views = store
+        .get_batch_views(&doc_hashes)
+        .wrap_err("failed to get batch views")?;
 
-        colbert_scores.insert(bm25_result.doc_id.clone(), score);
-        semantic_results.push(sgrep_core::SearchResult {
-            doc_id: bm25_result.doc_id.clone(),
-            score,
-        });
+    // Extract just the views for batch processing
+    let doc_views: Vec<_> = batch_views.iter().map(|(_, v)| *v).collect();
+
+    let colbert_scores_vec = gpu
+        .batch_maxsim(query_embedding.view(), &doc_views)
+        .wrap_err("failed to compute batch MaxSim")?;
+
+    // Build score maps
+    let mut colbert_scores: std::collections::HashMap<String, f32> =
+        std::collections::HashMap::new();
+    let mut semantic_results = Vec::new();
+
+    for (i, (hash, _)) in batch_views.iter().enumerate() {
+        // Find doc_id for this hash
+        let doc_id = doc_hashes
+            .iter()
+            .zip(doc_ids.iter())
+            .find(|(h, _)| **h == hash)
+            .map(|(_, id)| id.clone());
+
+        if let Some(doc_id) = doc_id {
+            let score = colbert_scores_vec[i];
+            colbert_scores.insert(doc_id.clone(), score);
+            semantic_results.push(sgrep_core::SearchResult { doc_id, score });
+        }
     }
 
     // Fuse results using RRF
@@ -316,10 +335,10 @@ fn index(path: &std::path::Path, verbose: bool) -> eyre::Result<()> {
     let bm25_index = sgrep_index::Bm25Index::new_at_path(&bm25_path)
         .wrap_err_with(|| format!("failed to create BM25 index at {bm25_path:?}"))?;
 
-    // Create CAS store for embeddings
-    let cas_path = index_path.join(CAS_DIR);
-    let cas = sgrep_cas::CasStore::new(cas_path.clone())
-        .wrap_err_with(|| format!("failed to create CAS store at {cas_path:?}"))?;
+    // Create embedding store
+    let embeddings_path = index_path.join(EMBEDDINGS_DIR);
+    let mut store = sgrep_cas::EmbeddingStore::open(embeddings_path.clone())
+        .wrap_err_with(|| format!("failed to create embedding store at {embeddings_path:?}"))?;
 
     // Load ColBERT encoder
     let mut encoder = load_encoder()?;
@@ -383,12 +402,14 @@ fn index(path: &std::path::Path, verbose: bool) -> eyre::Result<()> {
 
         // Compute and store embeddings (skip if already cached)
         let hash = sgrep_cas::ContentHash::from_content(&content_bytes);
-        if !cas.has_embeddings(&hash) {
+        if !store.has_embeddings(&hash) {
             match encoder.encode_document(content_str) {
                 Ok(embedding) => {
-                    cas.store_embeddings(&hash, &embedding).wrap_err_with(|| {
-                        format!("failed to store embeddings for {relative_path}")
-                    })?;
+                    store
+                        .store_embeddings(&hash, embedding.view())
+                        .wrap_err_with(|| {
+                            format!("failed to store embeddings for {relative_path}")
+                        })?;
                     embedded_count += 1;
                 }
                 Err(e) => {

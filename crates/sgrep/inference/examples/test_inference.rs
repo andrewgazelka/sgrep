@@ -21,15 +21,12 @@ fn main() -> eyre::Result<()> {
     for text in test_texts {
         tracing::info!(?text, "Encoding text...");
         let embedding = encoder.encode(text)?;
-        tracing::info!(
-            num_tokens = embedding.embeddings.len(),
-            dim = embedding.dim,
-            "Embedding generated"
-        );
+        let shape = embedding.shape();
+        tracing::info!(num_tokens = shape[0], dim = shape[1], "Embedding generated");
 
         // Print first few values of first token embedding
-        if let Some(first_emb) = embedding.embeddings.first() {
-            let preview: Vec<_> = first_emb.iter().take(5).collect();
+        if shape[0] > 0 {
+            let preview: Vec<_> = embedding.row(0).iter().take(5).copied().collect();
             tracing::info!(?preview, "First token embedding (first 5 values)");
         }
     }
@@ -39,7 +36,7 @@ fn main() -> eyre::Result<()> {
     let query_emb = encoder.encode("function main")?;
     let doc_emb = encoder.encode("fn main() { println!(\"Hello\"); }")?;
 
-    let score = sgrep_embed::maxsim(&query_emb, &doc_emb)?;
+    let score = sgrep_embed::maxsim(query_emb.view(), doc_emb.view())?;
     tracing::info!(?score, "MaxSim score between query and document");
 
     tracing::info!("Test completed successfully!");

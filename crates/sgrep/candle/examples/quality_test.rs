@@ -31,7 +31,7 @@ fn main() -> eyre::Result<()> {
         .iter()
         .map(|(code, desc)| {
             let emb = encoder.encode_document(code).unwrap();
-            let score = sgrep_embed::maxsim(&query, &emb).unwrap();
+            let score = sgrep_embed::maxsim(query.view(), emb.view()).unwrap();
             (score, *desc, *code)
         })
         .collect();
@@ -58,7 +58,7 @@ fn main() -> eyre::Result<()> {
         .iter()
         .map(|(code, desc)| {
             let emb = encoder.encode_document(code).unwrap();
-            let score = sgrep_embed::maxsim(&query, &emb).unwrap();
+            let score = sgrep_embed::maxsim(query.view(), emb.view()).unwrap();
             (score, *desc, *code)
         })
         .collect();
@@ -85,7 +85,7 @@ fn main() -> eyre::Result<()> {
         .iter()
         .map(|(code, desc)| {
             let emb = encoder.encode_document(code).unwrap();
-            let score = sgrep_embed::maxsim(&query, &emb).unwrap();
+            let score = sgrep_embed::maxsim(query.view(), emb.view()).unwrap();
             (score, *desc, *code)
         })
         .collect();
@@ -116,7 +116,7 @@ fn main() -> eyre::Result<()> {
         .iter()
         .map(|(code, desc)| {
             let emb = encoder.encode_document(code).unwrap();
-            let score = sgrep_embed::maxsim(&query, &emb).unwrap();
+            let score = sgrep_embed::maxsim(query.view(), emb.view()).unwrap();
             (score, *desc, *code)
         })
         .collect();
@@ -148,7 +148,7 @@ fn main() -> eyre::Result<()> {
         .iter()
         .map(|(code, desc)| {
             let emb = encoder.encode_document(code).unwrap();
-            let score = sgrep_embed::maxsim(&query, &emb).unwrap();
+            let score = sgrep_embed::maxsim(query.view(), emb.view()).unwrap();
             (score, *desc, *code)
         })
         .collect();

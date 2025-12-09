@@ -11,6 +11,8 @@ eyre.workspace = true
 blake3.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+ndarray.workspace = true
+memmap2.workspace = true
 
 [lints]
 workspace = true

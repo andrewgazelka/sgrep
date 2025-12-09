@@ -22,13 +22,13 @@ const MAX_SEQ_LENGTH: usize = 128;
 ///
 /// ColBERT uses asymmetric encoding with different markers for queries vs documents.
 /// See: <https://github.com/lightonai/pylate/blob/main/pylate/models/colbert.py>
-const QUERY_MARKER_TOKEN_ID: u32 = 250002;
+const QUERY_MARKER_TOKEN_ID: u32 = 250_002;
 
 /// Token ID for [DocumentMarker] in jina-colbert-v2 tokenizer.
 ///
 /// The marker is inserted after [CLS] token: `[CLS] [Marker] text...`
 /// See: <https://github.com/lightonai/pylate/blob/main/pylate/models/colbert.py>
-const DOCUMENT_MARKER_TOKEN_ID: u32 = 250003;
+const DOCUMENT_MARKER_TOKEN_ID: u32 = 250_003;
 
 /// A ColBERT encoder using Candle with Metal GPU acceleration.
 pub struct ColBertEncoder {
@@ -67,9 +67,9 @@ impl ColBertEncoder {
 
         // Load config
         let config_str = std::fs::read_to_string(config_path)
-            .wrap_err_with(|| format!("failed to read config from {config_path:?}"))?;
+            .wrap_err_with(|| format!("failed to read config from {}", config_path.display()))?;
         let config: JinaColBertConfig = serde_json::from_str(&config_str)
-            .wrap_err_with(|| format!("failed to parse config from {config_path:?}"))?;
+            .wrap_err_with(|| format!("failed to parse config from {}", config_path.display()))?;
 
         tracing::info!(?config, "loaded model config");
 
@@ -80,16 +80,16 @@ impl ColBertEncoder {
                 candle_core::DType::F32,
                 &device,
             )
-            .wrap_err_with(|| format!("failed to load weights from {model_path:?}"))?
+            .wrap_err_with(|| format!("failed to load weights from {}", model_path.display()))?
         };
 
         // Build model
         let model = model::JinaColBert::new(&config, vb).wrap_err("failed to build model")?;
 
         // Load tokenizer
-        tracing::info!(?tokenizer_path, "loading tokenizer");
+        tracing::info!(tokenizer_path = %tokenizer_path.display(), "loading tokenizer");
         let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
-            .map_err(|e| eyre::eyre!("failed to load tokenizer from {tokenizer_path:?}: {e}"))?;
+            .map_err(|e| eyre::eyre!("failed to load tokenizer from {}: {e}", tokenizer_path.display()))?;
 
         Ok(Self {
             model,
@@ -99,12 +99,12 @@ impl ColBertEncoder {
     }
 
     /// Encode a query into embeddings (uses [QueryMarker] prefix).
-    pub fn encode_query(&mut self, text: &str) -> eyre::Result<sgrep_core::DocumentEmbedding> {
+    pub fn encode_query(&mut self, text: &str) -> eyre::Result<sgrep_core::Embedding> {
         self.encode_with_marker(text, QUERY_MARKER_TOKEN_ID)
     }
 
     /// Encode a document into embeddings (uses [DocumentMarker] prefix).
-    pub fn encode_document(&mut self, text: &str) -> eyre::Result<sgrep_core::DocumentEmbedding> {
+    pub fn encode_document(&mut self, text: &str) -> eyre::Result<sgrep_core::Embedding> {
         self.encode_with_marker(text, DOCUMENT_MARKER_TOKEN_ID)
     }
 
@@ -113,7 +113,7 @@ impl ColBertEncoder {
         &mut self,
         text: &str,
         marker_token_id: u32,
-    ) -> eyre::Result<sgrep_core::DocumentEmbedding> {
+    ) -> eyre::Result<sgrep_core::Embedding> {
         let encoding = self
             .tokenizer
             .encode(text, true)
@@ -160,39 +160,45 @@ impl ColBertEncoder {
         let output = output
             .to_dtype(candle_core::DType::F32)
             .wrap_err("failed to convert output to f32")?;
+
+        // Convert to CPU and extract data
         let output = output
+            .to_device(&candle_core::Device::Cpu)
+            .wrap_err("failed to move output to CPU")?;
+
+        let output_vec = output
             .to_vec3::<f32>()
             .wrap_err("failed to convert output to vec")?;
 
-        // Only take actual tokens (not padding) and L2 normalize each embedding
-        let embeddings: Vec<Vec<f32>> = output
+        // Take the first batch, only actual tokens (not padding), and build ndarray
+        let batch = output_vec
             .into_iter()
             .next()
-            .ok_or_else(|| eyre::eyre!("empty output"))?
-            .into_iter()
-            .take(total_token_count)
-            .map(l2_normalize)
-            .collect();
+            .ok_or_else(|| eyre::eyre!("empty output"))?;
 
-        Ok(sgrep_core::DocumentEmbedding::new(
-            embeddings,
-            model::JinaColBert::OUTPUT_DIM,
-        ))
+        // Create contiguous ndarray and L2 normalize each row
+        let mut embedding = ndarray::Array2::zeros((total_token_count, sgrep_core::EMBEDDING_DIM));
+
+        for (i, token_emb) in batch.into_iter().take(total_token_count).enumerate() {
+            // L2 normalize
+            let norm: f32 = token_emb.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let norm = if norm > 0.0 { norm } else { 1.0 };
+
+            for (j, val) in token_emb.into_iter().enumerate() {
+                embedding[[i, j]] = val / norm;
+            }
+        }
+
+        Ok(embedding)
     }
 
     /// Encode multiple queries in a batch.
-    pub fn encode_queries(
-        &mut self,
-        texts: &[&str],
-    ) -> eyre::Result<Vec<sgrep_core::DocumentEmbedding>> {
+    pub fn encode_queries(&mut self, texts: &[&str]) -> eyre::Result<Vec<sgrep_core::Embedding>> {
         texts.iter().map(|text| self.encode_query(text)).collect()
     }
 
     /// Encode multiple documents in a batch.
-    pub fn encode_documents(
-        &mut self,
-        texts: &[&str],
-    ) -> eyre::Result<Vec<sgrep_core::DocumentEmbedding>> {
+    pub fn encode_documents(&mut self, texts: &[&str]) -> eyre::Result<Vec<sgrep_core::Embedding>> {
         texts
             .iter()
             .map(|text| self.encode_document(text))
@@ -229,14 +235,4 @@ pub fn default_device() -> eyre::Result<candle_core::Device> {
 #[must_use]
 pub fn cpu_device() -> candle_core::Device {
     candle_core::Device::Cpu
-}
-
-/// L2 normalize a vector.
-fn l2_normalize(v: Vec<f32>) -> Vec<f32> {
-    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        v.into_iter().map(|x| x / norm).collect()
-    } else {
-        v
-    }
 }

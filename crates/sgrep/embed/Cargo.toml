@@ -5,11 +5,17 @@ edition.workspace = true
 license.workspace = true
 description = "Embedding generation and ColBERT MaxSim scoring"
 
+[features]
+default = ["metal"]
+metal = ["candle-core/metal"]
+
 [dependencies]
 sgrep-core.workspace = true
 eyre.workspace = true
 tracing.workspace = true
 tokenizers.workspace = true
+ndarray.workspace = true
+candle-core.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

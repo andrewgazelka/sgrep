@@ -8,6 +8,8 @@ description = "Core types and traits for sgrep"
 [dependencies]
 eyre.workspace = true
 serde.workspace = true
+ndarray.workspace = true
+blas-src.workspace = true
 
 [lints]
 workspace = true

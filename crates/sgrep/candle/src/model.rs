@@ -43,7 +43,7 @@ fn default_rotary_base() -> f64 {
 impl Default for JinaColBertConfig {
     fn default() -> Self {
         Self {
-            vocab_size: 250004,
+            vocab_size: 250_004,
             hidden_size: 1024,
             num_hidden_layers: 24,
             num_attention_heads: 16,

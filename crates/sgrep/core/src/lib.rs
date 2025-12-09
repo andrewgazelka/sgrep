@@ -1,30 +1,20 @@
 //! Core types and traits for sgrep.
 
-/// A token embedding - a vector of floats representing a single token.
-pub type TokenEmbedding = Vec<f32>;
+// Link Accelerate BLAS
+#[expect(unused_extern_crates, reason = "needed to link BLAS")]
+extern crate blas_src;
 
-/// A document's embedding - a matrix where each row is a token embedding.
-/// This is the ColBERT representation: one vector per token.
-#[derive(Debug, Clone)]
-pub struct DocumentEmbedding {
-    /// The embeddings for each token in the document.
-    /// Shape: [num_tokens, embedding_dim]
-    pub embeddings: Vec<TokenEmbedding>,
-    /// The dimensionality of each embedding vector.
-    pub dim: usize,
-}
+/// Embedding dimension for ColBERT (Jina ColBERT v2 uses 128).
+pub const EMBEDDING_DIM: usize = 128;
 
-impl DocumentEmbedding {
-    /// Create a new document embedding.
-    pub fn new(embeddings: Vec<TokenEmbedding>, dim: usize) -> Self {
-        Self { embeddings, dim }
-    }
+/// A document's embedding - a contiguous matrix where each row is a token embedding.
+/// Shape: [num_tokens, EMBEDDING_DIM]
+///
+/// Uses row-major (C) layout for efficient BLAS operations.
+pub type Embedding = ndarray::Array2<f32>;
 
-    /// Number of tokens in this document.
-    pub fn num_tokens(&self) -> usize {
-        self.embeddings.len()
-    }
-}
+/// A view into an embedding (for zero-copy access from mmap).
+pub type EmbeddingView<'a> = ndarray::ArrayView2<'a, f32>;
 
 /// A search result with score and document identifier.
 #[derive(Debug, Clone)]

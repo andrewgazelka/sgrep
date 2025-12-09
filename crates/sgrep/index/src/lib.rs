@@ -34,8 +34,7 @@ impl Bm25Index {
         let index = tantivy::Index::create_in_ram(schema.clone());
 
         // Register code tokenizer
-        let tokenizer = CodeTokenizer::default();
-        index.tokenizers().register("code", tokenizer);
+        index.tokenizers().register("code", CodeTokenizer);
 
         Ok(Self {
             index,
@@ -48,7 +47,7 @@ impl Bm25Index {
     /// Create a new index at the given path.
     pub fn new_at_path(path: &std::path::Path) -> eyre::Result<Self> {
         std::fs::create_dir_all(path)
-            .wrap_err_with(|| format!("failed to create index directory at {path:?}"))?;
+            .wrap_err_with(|| format!("failed to create index directory at {}", path.display()))?;
 
         let mut schema_builder = tantivy::schema::Schema::builder();
 
@@ -66,12 +65,11 @@ impl Bm25Index {
 
         let schema = schema_builder.build();
         let dir = tantivy::directory::MmapDirectory::open(path)
-            .wrap_err_with(|| format!("failed to open mmap directory at {path:?}"))?;
+            .wrap_err_with(|| format!("failed to open mmap directory at {}", path.display()))?;
         let index = tantivy::Index::open_or_create(dir, schema.clone())
             .wrap_err("failed to open or create index")?;
 
-        let tokenizer = CodeTokenizer::default();
-        index.tokenizers().register("code", tokenizer);
+        index.tokenizers().register("code", CodeTokenizer);
 
         Ok(Self {
             index,

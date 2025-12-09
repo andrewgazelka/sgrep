@@ -1,216 +1,397 @@
-//! Content-addressable storage with blake3 hashing.
+//! Embedding storage with two-file format for efficient I/O.
+//!
+//! Uses two files:
+//! - `embeddings.dat`: Append-only data file with concatenated f32 embeddings
+//! - `embeddings.idx`: Index file mapping content hashes to offsets
+//!
+//! This design allows:
+//! - Append-only writes to data file (no rewriting)
+//! - Single mmap for all reads
+//! - Fast batch lookups for GPU operations
 
-use std::io::Write as _;
+use std::io::{Read as _, Seek as _, Write as _};
 
 use eyre::WrapErr as _;
 
+const DATA_FILE: &str = "embeddings.dat";
+const INDEX_FILE: &str = "embeddings.idx";
+
+/// Magic bytes for index file validation.
+const INDEX_MAGIC: u32 = 0x5347_5250; // "SGRP"
+const INDEX_VERSION: u32 = 1;
+
+/// Size of each index entry: 32 bytes hash + 8 bytes offset + 4 bytes num_tokens = 44 bytes
+const INDEX_ENTRY_SIZE: usize = 44;
+
+/// Index file header size: 4 bytes magic + 4 bytes version + 4 bytes count = 12 bytes
+const INDEX_HEADER_SIZE: usize = 12;
+
 /// A content hash using blake3.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ContentHash(pub [u8; 32]);
 
 impl ContentHash {
     /// Create a hash from content bytes.
+    #[must_use]
     pub fn from_content(content: &[u8]) -> Self {
         Self(*blake3::hash(content).as_bytes())
     }
 
     /// Get the hash as a hex string.
-    pub fn to_hex(&self) -> String {
-        hex::encode(&self.0)
-    }
-
-    /// Parse from a hex string.
-    pub fn from_hex(s: &str) -> eyre::Result<Self> {
-        let bytes = hex::decode(s).map_err(|e| eyre::eyre!("invalid hex string: {e}"))?;
-        let arr: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| eyre::eyre!("hash must be 32 bytes"))?;
-        Ok(Self(arr))
+    #[must_use]
+    pub fn to_hex(self) -> String {
+        let mut s = String::with_capacity(64);
+        for b in self.0 {
+            use std::fmt::Write as _;
+            let _ = write!(s, "{b:02x}");
+        }
+        s
     }
 }
 
 impl std::fmt::Display for ContentHash {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_hex())
+        for b in self.0 {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
     }
 }
 
-/// Content-addressable store for embeddings and content.
-pub struct CasStore {
+/// An entry in the index file.
+#[derive(Debug, Clone, Copy)]
+struct IndexEntry {
+    hash: ContentHash,
+    offset: u64,
+    num_tokens: u32,
+}
+
+impl IndexEntry {
+    fn to_bytes(self) -> [u8; INDEX_ENTRY_SIZE] {
+        let mut buf = [0u8; INDEX_ENTRY_SIZE];
+        buf[..32].copy_from_slice(&self.hash.0);
+        buf[32..40].copy_from_slice(&self.offset.to_le_bytes());
+        buf[40..44].copy_from_slice(&self.num_tokens.to_le_bytes());
+        buf
+    }
+
+    fn from_bytes(buf: &[u8; INDEX_ENTRY_SIZE]) -> Self {
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&buf[..32]);
+
+        let offset = u64::from_le_bytes([
+            buf[32], buf[33], buf[34], buf[35], buf[36], buf[37], buf[38], buf[39],
+        ]);
+        let num_tokens = u32::from_le_bytes([buf[40], buf[41], buf[42], buf[43]]);
+
+        Self {
+            hash: ContentHash(hash),
+            offset,
+            num_tokens,
+        }
+    }
+}
+
+/// Memory-mapped embedding store for efficient batch access.
+pub struct EmbeddingStore {
     base_path: std::path::PathBuf,
+    /// Memory-mapped data file (lazily initialized on first read)
+    mmap: Option<memmap2::Mmap>,
+    /// In-memory index: hash -> (offset, num_tokens)
+    index: std::collections::HashMap<ContentHash, (u64, u32)>,
 }
 
-impl CasStore {
-    /// Create a new CAS store at the given path.
-    pub fn new(base_path: std::path::PathBuf) -> eyre::Result<Self> {
+impl EmbeddingStore {
+    /// Open or create an embedding store at the given path.
+    pub fn open(base_path: std::path::PathBuf) -> eyre::Result<Self> {
         std::fs::create_dir_all(&base_path)
-            .wrap_err_with(|| format!("failed to create CAS directory at {base_path:?}"))?;
-        Ok(Self { base_path })
+            .wrap_err_with(|| format!("failed to create directory {}", base_path.display()))?;
+
+        let mut store = Self {
+            base_path,
+            mmap: None,
+            index: std::collections::HashMap::new(),
+        };
+
+        // Load existing index if present
+        store.load_index()?;
+
+        Ok(store)
     }
 
-    /// Get the path for a given hash.
-    fn path_for_hash(&self, hash: &ContentHash, suffix: &str) -> std::path::PathBuf {
-        let hex = hash.to_hex();
-        // Use first 2 chars as subdirectory for sharding
-        let (prefix, rest) = hex.split_at(2);
-        self.base_path.join(prefix).join(format!("{rest}{suffix}"))
-    }
+    /// Load the index file into memory.
+    fn load_index(&mut self) -> eyre::Result<()> {
+        let index_path = self.base_path.join(INDEX_FILE);
 
-    /// Store content and return its hash.
-    pub fn store_content(&self, content: &[u8]) -> eyre::Result<ContentHash> {
-        let hash = ContentHash::from_content(content);
-        let path = self.path_for_hash(&hash, "");
-
-        if path.exists() {
-            return Ok(hash);
+        if !index_path.exists() {
+            return Ok(());
         }
 
-        let parent = path.parent().ok_or_else(|| eyre::eyre!("no parent dir"))?;
-        std::fs::create_dir_all(parent)
-            .wrap_err_with(|| format!("failed to create directory {parent:?}"))?;
+        let mut file = std::fs::File::open(&index_path)
+            .wrap_err_with(|| format!("failed to open index file {}", index_path.display()))?;
 
-        let file = std::fs::File::create(&path)
-            .wrap_err_with(|| format!("failed to create file {path:?}"))?;
-        let mut writer = std::io::BufWriter::new(file);
-        writer
-            .write_all(content)
-            .wrap_err("failed to write content")?;
+        // Read header
+        let mut header = [0u8; INDEX_HEADER_SIZE];
+        file.read_exact(&mut header)
+            .wrap_err("failed to read index header")?;
 
-        Ok(hash)
-    }
+        let magic = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        let version = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+        let count = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
 
-    /// Store embeddings for a content hash.
-    pub fn store_embeddings(
-        &self,
-        hash: &ContentHash,
-        embedding: &sgrep_core::DocumentEmbedding,
-    ) -> eyre::Result<()> {
-        let path = self.path_for_hash(hash, ".emb");
+        if magic != INDEX_MAGIC {
+            eyre::bail!("invalid index file magic: expected {INDEX_MAGIC:#x}, got {magic:#x}");
+        }
 
-        let parent = path.parent().ok_or_else(|| eyre::eyre!("no parent dir"))?;
-        std::fs::create_dir_all(parent)
-            .wrap_err_with(|| format!("failed to create directory {parent:?}"))?;
+        if version != INDEX_VERSION {
+            eyre::bail!("unsupported index version: expected {INDEX_VERSION}, got {version}");
+        }
 
-        // Simple binary format: dim (u32), num_tokens (u32), then f32s
-        let file = std::fs::File::create(&path)
-            .wrap_err_with(|| format!("failed to create embedding file {path:?}"))?;
-        let mut writer = std::io::BufWriter::new(file);
+        // Read entries
+        self.index.clear();
+        self.index.reserve(count as usize);
 
-        use std::io::Write as _;
-
-        let dim = u32::try_from(embedding.dim).wrap_err("dim too large")?;
-        let num_tokens = u32::try_from(embedding.num_tokens()).wrap_err("too many tokens")?;
-
-        writer
-            .write_all(&dim.to_le_bytes())
-            .wrap_err("failed to write dim")?;
-        writer
-            .write_all(&num_tokens.to_le_bytes())
-            .wrap_err("failed to write num_tokens")?;
-
-        for token_emb in &embedding.embeddings {
-            for &val in token_emb {
-                writer
-                    .write_all(&val.to_le_bytes())
-                    .wrap_err("failed to write embedding value")?;
-            }
+        let mut entry_buf = [0u8; INDEX_ENTRY_SIZE];
+        for _ in 0..count {
+            file.read_exact(&mut entry_buf)
+                .wrap_err("failed to read index entry")?;
+            let entry = IndexEntry::from_bytes(&entry_buf);
+            self.index
+                .insert(entry.hash, (entry.offset, entry.num_tokens));
         }
 
         Ok(())
     }
 
-    /// Load embeddings for a content hash.
-    pub fn load_embeddings(
-        &self,
-        hash: &ContentHash,
-    ) -> eyre::Result<Option<sgrep_core::DocumentEmbedding>> {
-        use std::io::Read as _;
+    /// Write the index file from memory.
+    fn write_index(&self) -> eyre::Result<()> {
+        let index_path = self.base_path.join(INDEX_FILE);
 
-        let path = self.path_for_hash(hash, ".emb");
+        let file = std::fs::File::create(&index_path)
+            .wrap_err_with(|| format!("failed to create index file {}", index_path.display()))?;
+        let mut writer = std::io::BufWriter::new(file);
 
-        if !path.exists() {
-            return Ok(None);
+        // Write header
+        writer
+            .write_all(&INDEX_MAGIC.to_le_bytes())
+            .wrap_err("failed to write magic")?;
+        writer
+            .write_all(&INDEX_VERSION.to_le_bytes())
+            .wrap_err("failed to write version")?;
+
+        let count = u32::try_from(self.index.len()).wrap_err("too many entries")?;
+        writer
+            .write_all(&count.to_le_bytes())
+            .wrap_err("failed to write count")?;
+
+        // Write entries
+        for (&hash, &(offset, num_tokens)) in &self.index {
+            let entry = IndexEntry {
+                hash,
+                offset,
+                num_tokens,
+            };
+            writer
+                .write_all(&entry.to_bytes())
+                .wrap_err("failed to write entry")?;
         }
 
-        let file = std::fs::File::open(&path)
-            .wrap_err_with(|| format!("failed to open embedding file {path:?}"))?;
-        let mut reader = std::io::BufReader::new(file);
-
-        let mut buf4 = [0u8; 4];
-
-        reader
-            .read_exact(&mut buf4)
-            .wrap_err("failed to read dim")?;
-        let dim = u32::from_le_bytes(buf4) as usize;
-
-        reader
-            .read_exact(&mut buf4)
-            .wrap_err("failed to read num_tokens")?;
-        let num_tokens = u32::from_le_bytes(buf4) as usize;
-
-        let mut embeddings = Vec::with_capacity(num_tokens);
-        for _ in 0..num_tokens {
-            let mut token_emb = Vec::with_capacity(dim);
-            for _ in 0..dim {
-                reader
-                    .read_exact(&mut buf4)
-                    .wrap_err("failed to read embedding value")?;
-                token_emb.push(f32::from_le_bytes(buf4));
-            }
-            embeddings.push(token_emb);
-        }
-
-        Ok(Some(sgrep_core::DocumentEmbedding::new(embeddings, dim)))
+        Ok(())
     }
 
-    /// Check if content exists.
-    pub fn has_content(&self, hash: &ContentHash) -> bool {
-        self.path_for_hash(hash, "").exists()
+    /// Ensure the mmap is initialized.
+    fn ensure_mmap(&mut self) -> eyre::Result<()> {
+        if self.mmap.is_some() {
+            return Ok(());
+        }
+
+        let data_path = self.base_path.join(DATA_FILE);
+        if !data_path.exists() {
+            return Ok(());
+        }
+
+        let file = std::fs::File::open(&data_path)
+            .wrap_err_with(|| format!("failed to open data file {}", data_path.display()))?;
+
+        let mmap = unsafe {
+            memmap2::Mmap::map(&file)
+                .wrap_err_with(|| format!("failed to mmap {}", data_path.display()))?
+        };
+
+        self.mmap = Some(mmap);
+        Ok(())
     }
 
     /// Check if embeddings exist for a hash.
+    #[must_use]
     pub fn has_embeddings(&self, hash: &ContentHash) -> bool {
-        self.path_for_hash(hash, ".emb").exists()
-    }
-}
-
-// Add hex as a dependency
-mod hex {
-    const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
-
-    pub fn encode(bytes: &[u8; 32]) -> String {
-        let mut s = String::with_capacity(64);
-        for &b in bytes {
-            s.push(HEX_CHARS[(b >> 4) as usize] as char);
-            s.push(HEX_CHARS[(b & 0xf) as usize] as char);
-        }
-        s
+        self.index.contains_key(hash)
     }
 
-    pub fn decode(s: &str) -> Result<Vec<u8>, &'static str> {
-        if s.len() % 2 != 0 {
-            return Err("odd length");
+    /// Store embeddings for a content hash.
+    pub fn store_embeddings(
+        &mut self,
+        hash: &ContentHash,
+        embedding: sgrep_core::EmbeddingView<'_>,
+    ) -> eyre::Result<()> {
+        // Skip if already stored
+        if self.index.contains_key(hash) {
+            return Ok(());
         }
 
-        let mut bytes = Vec::with_capacity(s.len() / 2);
-        let chars: Vec<char> = s.chars().collect();
+        let shape = embedding.shape();
+        let num_tokens = shape[0];
+        let dim = shape[1];
 
-        for chunk in chars.chunks(2) {
-            let hi = hex_digit(chunk[0])?;
-            let lo = hex_digit(chunk[1])?;
-            bytes.push((hi << 4) | lo);
+        if dim != sgrep_core::EMBEDDING_DIM {
+            eyre::bail!(
+                "expected embedding dim {}, got {dim}",
+                sgrep_core::EMBEDDING_DIM
+            );
         }
 
-        Ok(bytes)
+        let data_path = self.base_path.join(DATA_FILE);
+
+        // Open file for appending
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&data_path)
+            .wrap_err_with(|| format!("failed to open data file {}", data_path.display()))?;
+
+        // Get current offset (file size)
+        let offset = file
+            .seek(std::io::SeekFrom::End(0))
+            .wrap_err("failed to seek to end")?;
+
+        // Write embedding data
+        if embedding.is_standard_layout() {
+            let slice = embedding.as_slice().expect("standard layout but no slice");
+            let bytes =
+                unsafe { std::slice::from_raw_parts(slice.as_ptr().cast::<u8>(), slice.len() * 4) };
+            file.write_all(bytes)
+                .wrap_err("failed to write embeddings")?;
+        } else {
+            for &val in embedding.iter() {
+                file.write_all(&val.to_le_bytes())
+                    .wrap_err("failed to write embedding value")?;
+            }
+        }
+
+        // Update index
+        let num_tokens_u32 = u32::try_from(num_tokens).wrap_err("too many tokens")?;
+        self.index.insert(*hash, (offset, num_tokens_u32));
+
+        // Invalidate mmap (will be recreated on next read)
+        self.mmap = None;
+
+        // Write updated index
+        self.write_index()?;
+
+        Ok(())
     }
 
-    fn hex_digit(c: char) -> Result<u8, &'static str> {
-        match c {
-            '0'..='9' => Ok(c as u8 - b'0'),
-            'a'..='f' => Ok(c as u8 - b'a' + 10),
-            'A'..='F' => Ok(c as u8 - b'A' + 10),
-            _ => Err("invalid hex digit"),
+    /// Get a view into embedding data for a hash.
+    ///
+    /// Returns `(data_ptr, num_tokens)` for zero-copy access.
+    pub fn get_embedding_view(
+        &mut self,
+        hash: &ContentHash,
+    ) -> eyre::Result<Option<sgrep_core::EmbeddingView<'_>>> {
+        let Some(&(offset, num_tokens)) = self.index.get(hash) else {
+            return Ok(None);
+        };
+
+        self.ensure_mmap()?;
+
+        let Some(mmap) = &self.mmap else {
+            return Ok(None);
+        };
+
+        let num_tokens = num_tokens as usize;
+        let byte_offset = offset as usize;
+        let num_floats = num_tokens * sgrep_core::EMBEDDING_DIM;
+        let byte_len = num_floats * 4;
+
+        // Bounds check
+        if byte_offset + byte_len > mmap.len() {
+            eyre::bail!(
+                "embedding data out of bounds: offset={byte_offset}, len={byte_len}, file_size={}",
+                mmap.len()
+            );
         }
+
+        // Create view into mmap
+        let data_ptr = unsafe { mmap.as_ptr().add(byte_offset) };
+        let data_slice = unsafe { std::slice::from_raw_parts(data_ptr.cast::<f32>(), num_floats) };
+
+        let view =
+            ndarray::ArrayView2::from_shape((num_tokens, sgrep_core::EMBEDDING_DIM), data_slice)
+                .wrap_err("failed to create array view")?;
+
+        Ok(Some(view))
+    }
+
+    /// Get multiple embedding views for batch processing.
+    ///
+    /// Returns views in the same order as input hashes. Missing hashes are skipped.
+    pub fn get_batch_views(
+        &mut self,
+        hashes: &[&ContentHash],
+    ) -> eyre::Result<Vec<(ContentHash, sgrep_core::EmbeddingView<'_>)>> {
+        self.ensure_mmap()?;
+
+        let Some(mmap) = &self.mmap else {
+            return Ok(Vec::new());
+        };
+
+        let mut results = Vec::with_capacity(hashes.len());
+
+        for &hash in hashes {
+            let Some(&(offset, num_tokens)) = self.index.get(hash) else {
+                continue;
+            };
+
+            let num_tokens = num_tokens as usize;
+            let byte_offset = offset as usize;
+            let num_floats = num_tokens * sgrep_core::EMBEDDING_DIM;
+            let byte_len = num_floats * 4;
+
+            if byte_offset + byte_len > mmap.len() {
+                continue;
+            }
+
+            let data_ptr = unsafe { mmap.as_ptr().add(byte_offset) };
+            let data_slice =
+                unsafe { std::slice::from_raw_parts(data_ptr.cast::<f32>(), num_floats) };
+
+            let view = ndarray::ArrayView2::from_shape(
+                (num_tokens, sgrep_core::EMBEDDING_DIM),
+                data_slice,
+            )
+            .wrap_err("failed to create array view")?;
+
+            results.push((*hash, view));
+        }
+
+        Ok(results)
+    }
+
+    /// Number of stored embeddings.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    /// Check if store is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
+    /// Iterate over all stored hashes.
+    pub fn hashes(&self) -> impl Iterator<Item = &ContentHash> {
+        self.index.keys()
     }
 }
 
@@ -223,30 +404,73 @@ mod tests {
         let hash = ContentHash::from_content(b"hello world");
         let hex = hash.to_hex();
         assert_eq!(hex.len(), 64);
-
-        let parsed = ContentHash::from_hex(&hex).unwrap();
-        assert_eq!(hash, parsed);
     }
 
     #[test]
-    fn test_cas_store_roundtrip() {
-        let tmp = std::env::temp_dir().join("sgrep-cas-test");
+    fn test_store_roundtrip() {
+        let tmp = std::env::temp_dir().join("sgrep-store-test");
         let _ = std::fs::remove_dir_all(&tmp);
 
-        let store = CasStore::new(tmp.clone()).unwrap();
+        let mut store = EmbeddingStore::open(tmp.clone()).unwrap();
 
         let content = b"test content";
-        let hash = store.store_content(content).unwrap();
-        assert!(store.has_content(&hash));
+        let hash = ContentHash::from_content(content);
 
-        let embedding =
-            sgrep_core::DocumentEmbedding::new(vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]], 3);
-        store.store_embeddings(&hash, &embedding).unwrap();
+        // Create embedding
+        let embedding = ndarray::Array2::from_shape_fn((3, sgrep_core::EMBEDDING_DIM), |(i, j)| {
+            (i * sgrep_core::EMBEDDING_DIM + j) as f32
+        });
+
+        // Store
+        store.store_embeddings(&hash, embedding.view()).unwrap();
         assert!(store.has_embeddings(&hash));
 
-        let loaded = store.load_embeddings(&hash).unwrap().unwrap();
-        assert_eq!(loaded.dim, 3);
-        assert_eq!(loaded.num_tokens(), 2);
+        // Reload store
+        drop(store);
+        let mut store = EmbeddingStore::open(tmp.clone()).unwrap();
+        assert!(store.has_embeddings(&hash));
+
+        // Load and verify
+        let view = store.get_embedding_view(&hash).unwrap().unwrap();
+        assert_eq!(view.shape(), &[3, sgrep_core::EMBEDDING_DIM]);
+
+        for i in 0..3 {
+            for j in 0..sgrep_core::EMBEDDING_DIM {
+                let expected = (i * sgrep_core::EMBEDDING_DIM + j) as f32;
+                assert!((view[[i, j]] - expected).abs() < 1e-6);
+            }
+        }
+
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn test_multiple_embeddings() {
+        let tmp = std::env::temp_dir().join("sgrep-store-multi-test");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let mut store = EmbeddingStore::open(tmp.clone()).unwrap();
+
+        // Store multiple embeddings
+        for i in 0..5 {
+            let content = format!("content {i}");
+            let hash = ContentHash::from_content(content.as_bytes());
+            let embedding =
+                ndarray::Array2::from_shape_fn((i + 2, sgrep_core::EMBEDDING_DIM), |(r, c)| {
+                    (i * 1000 + r * 100 + c) as f32
+                });
+            store.store_embeddings(&hash, embedding.view()).unwrap();
+        }
+
+        assert_eq!(store.len(), 5);
+
+        // Verify all can be loaded
+        for i in 0..5 {
+            let content = format!("content {i}");
+            let hash = ContentHash::from_content(content.as_bytes());
+            let view = store.get_embedding_view(&hash).unwrap().unwrap();
+            assert_eq!(view.shape()[0], i + 2);
+        }
 
         std::fs::remove_dir_all(&tmp).unwrap();
     }

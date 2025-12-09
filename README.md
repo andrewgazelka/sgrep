@@ -6,13 +6,27 @@
   <code>cargo install --git https://github.com/andrewgazelka/sgrep</code>
 </p>
 
-Code search that understands meaning, not just keywords. Combines BM25 lexical search with Jina ColBERT v2 neural embeddings using late interaction for state-of-the-art retrieval.
+Local semantic code search for M-series Macs. No API keys, no cloud, no latency—just fast neural search running entirely on your machine.
+
+## Why sgrep?
+
+**grep finds text. sgrep finds meaning.**
+
+Traditional code search fails when you don't know the exact keywords. Searching "authentication logic" won't find `verify_credentials()`. Searching "error handling" won't find `match result { Err(e) => ... }`.
+
+sgrep uses ColBERT neural embeddings to understand *what code does*, not just what it says. Combined with BM25 for exact matches, you get the best of both worlds.
+
+**Why local?**
+- **Private**: Your code never leaves your machine
+- **Fast**: ~70ms inference on M-series chips via Metal GPU
+- **Offline**: Works without internet after initial model download
+- **Free**: No API keys, no cloud costs, no rate limits
 
 ## Features
 
 - **Hybrid Search**: Fuses BM25 keyword matching with ColBERT semantic similarity via reciprocal rank fusion
 - **Late Interaction**: Token-level embeddings with MaxSim scoring preserve nuance that single-vector approaches miss
-- **Fast on Apple Silicon**: Native Metal acceleration via Candle (~70ms per inference)
+- **M-series Optimized**: Native Metal GPU acceleration via Candle
 - **Content-Addressed Caching**: Embeddings stored by content hash, survives file renames
 
 ## Usage
@@ -38,16 +52,16 @@ sgrep search --json "error handling"
 
 ## Model
 
-Uses [Jina ColBERT v2](https://huggingface.co/jinaai/jina-colbert-v2), an XLM-RoBERTa variant with rotary position embeddings. Model weights download automatically on first run.
+Uses [Jina ColBERT v2](https://huggingface.co/jinaai/jina-colbert-v2), an XLM-RoBERTa variant with rotary position embeddings. Model weights download automatically on first run (~500MB).
 
-## Status
+## Requirements
 
-Working CLI with index and search commands. Apple Silicon optimized via Metal GPU acceleration.
+**macOS with M-series chip** (M1/M2/M3/M4). Built specifically for Apple Silicon using Metal for GPU acceleration.
 
 ---
 
 <details>
-<summary>Benchmark (Apple Silicon)</summary>
+<summary>Benchmarks</summary>
 
 | Backend | Inference Time |
 |---------|----------------|

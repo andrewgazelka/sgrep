@@ -42,7 +42,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # ONNX Runtime for ML inference (coreml for ANE acceleration on macOS)
 ort = { version = "2.0.0-rc.10", features = ["coreml"] }
-ndarray = "0.16"
 
 # Hashing
 blake3 = "1"
@@ -66,6 +65,13 @@ candle-nn = "0.9"
 candle-transformers = "0.9"
 hf-hub = "0.4"
 unicode-segmentation = "1"
+
+# Linear algebra with Accelerate BLAS
+ndarray = { version = "0.16", features = ["blas"] }
+blas-src = { version = "0.14", features = ["accelerate"] }
+
+# Memory mapping for zero-copy I/O
+memmap2 = "0.9.9"
 
 # Testing
 criterion = { version = "0.5", features = ["html_reports"] }

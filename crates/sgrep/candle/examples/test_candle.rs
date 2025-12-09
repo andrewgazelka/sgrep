@@ -32,15 +32,17 @@ fn main() -> eyre::Result<()> {
     for text in test_docs {
         tracing::info!(?text, "Encoding document...");
         let embedding = encoder.encode_document(text)?;
+        let shape = embedding.shape();
         tracing::info!(
-            num_tokens = embedding.embeddings.len(),
-            dim = embedding.dim,
+            num_tokens = shape[0],
+            dim = shape[1],
             "Document embedding generated"
         );
 
         // Print first few values of first token embedding
-        if let Some(first_emb) = embedding.embeddings.first() {
-            let preview: Vec<_> = first_emb
+        if shape[0] > 0 {
+            let preview: Vec<_> = embedding
+                .row(0)
                 .iter()
                 .take(5)
                 .map(|v| format!("{v:.4}"))
@@ -54,7 +56,7 @@ fn main() -> eyre::Result<()> {
     let query_emb = encoder.encode_query("function main")?;
     let doc_emb = encoder.encode_document("fn main() { println!(\"Hello\"); }")?;
 
-    let score = sgrep_embed::maxsim(&query_emb, &doc_emb)?;
+    let score = sgrep_embed::maxsim(query_emb.view(), doc_emb.view())?;
     tracing::info!(?score, "MaxSim score between query and document");
 
     // Test semantic similarity - should be higher for related texts
@@ -64,8 +66,8 @@ fn main() -> eyre::Result<()> {
     let code_related = encoder.encode_document("try { } catch (e) { handle(e); }")?;
     let code_unrelated = encoder.encode_document("Hello world greeting message")?;
 
-    let score_related = sgrep_embed::maxsim(&code_query, &code_related)?;
-    let score_unrelated = sgrep_embed::maxsim(&code_query, &code_unrelated)?;
+    let score_related = sgrep_embed::maxsim(code_query.view(), code_related.view())?;
+    let score_unrelated = sgrep_embed::maxsim(code_query.view(), code_unrelated.view())?;
 
     tracing::info!(
         ?score_related,
