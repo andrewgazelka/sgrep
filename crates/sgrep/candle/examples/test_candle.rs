@@ -1,4 +1,4 @@
-//! Test Candle inference and compare with ONNX if available.
+//! Test Candle inference with proper query/document marker tokens.
 
 use eyre::WrapErr as _;
 
@@ -22,19 +22,20 @@ fn main() -> eyre::Result<()> {
         sgrep_candle::ColBertEncoder::load(&model_path, &tokenizer_path, &config_path)
             .wrap_err("failed to load Candle encoder")?;
 
-    let test_texts = [
+    // Test document encoding
+    let test_docs = [
         "Hello, world!",
         "fn main() { println!(\"Hello\"); }",
         "This is a test of the semantic grep system.",
     ];
 
-    for text in test_texts {
-        tracing::info!(?text, "Encoding text...");
-        let embedding = encoder.encode(text)?;
+    for text in test_docs {
+        tracing::info!(?text, "Encoding document...");
+        let embedding = encoder.encode_document(text)?;
         tracing::info!(
             num_tokens = embedding.embeddings.len(),
             dim = embedding.dim,
-            "Embedding generated"
+            "Document embedding generated"
         );
 
         // Print first few values of first token embedding
@@ -44,10 +45,10 @@ fn main() -> eyre::Result<()> {
         }
     }
 
-    // Test MaxSim scoring between two embeddings
-    tracing::info!("Testing MaxSim scoring...");
-    let query_emb = encoder.encode("function main")?;
-    let doc_emb = encoder.encode("fn main() { println!(\"Hello\"); }")?;
+    // Test MaxSim scoring between query and document embeddings
+    tracing::info!("Testing MaxSim scoring with proper query/document encoding...");
+    let query_emb = encoder.encode_query("function main")?;
+    let doc_emb = encoder.encode_document("fn main() { println!(\"Hello\"); }")?;
 
     let score = sgrep_embed::maxsim(&query_emb, &doc_emb)?;
     tracing::info!(?score, "MaxSim score between query and document");
@@ -55,9 +56,9 @@ fn main() -> eyre::Result<()> {
     // Test semantic similarity - should be higher for related texts
     tracing::info!("Testing semantic similarity...");
 
-    let code_query = encoder.encode("error handling")?;
-    let code_related = encoder.encode("try { } catch (e) { handle(e); }")?;
-    let code_unrelated = encoder.encode("Hello world greeting message")?;
+    let code_query = encoder.encode_query("error handling")?;
+    let code_related = encoder.encode_document("try { } catch (e) { handle(e); }")?;
+    let code_unrelated = encoder.encode_document("Hello world greeting message")?;
 
     let score_related = sgrep_embed::maxsim(&code_query, &code_related)?;
     let score_unrelated = sgrep_embed::maxsim(&code_query, &code_unrelated)?;

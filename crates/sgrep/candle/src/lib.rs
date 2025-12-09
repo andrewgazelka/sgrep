@@ -12,6 +12,12 @@ pub use model::JinaColBertConfig;
 /// Maximum sequence length for input tokenization.
 const MAX_SEQ_LENGTH: usize = 128;
 
+/// Token ID for [QueryMarker] in jina-colbert-v2 tokenizer.
+const QUERY_MARKER_TOKEN_ID: u32 = 250002;
+
+/// Token ID for [DocumentMarker] in jina-colbert-v2 tokenizer.
+const DOCUMENT_MARKER_TOKEN_ID: u32 = 250003;
+
 /// A ColBERT encoder using Candle with Metal GPU acceleration.
 pub struct ColBertEncoder {
     model: model::JinaColBert,
@@ -86,22 +92,50 @@ impl ColBertEncoder {
         })
     }
 
-    /// Encode text into a document embedding (per-token embeddings).
-    pub fn encode(&mut self, text: &str) -> eyre::Result<sgrep_core::DocumentEmbedding> {
+    /// Encode a query into embeddings (uses [QueryMarker] prefix).
+    pub fn encode_query(&mut self, text: &str) -> eyre::Result<sgrep_core::DocumentEmbedding> {
+        self.encode_with_marker(text, QUERY_MARKER_TOKEN_ID)
+    }
+
+    /// Encode a document into embeddings (uses [DocumentMarker] prefix).
+    pub fn encode_document(&mut self, text: &str) -> eyre::Result<sgrep_core::DocumentEmbedding> {
+        self.encode_with_marker(text, DOCUMENT_MARKER_TOKEN_ID)
+    }
+
+    /// Encode text with a specific marker token inserted after [CLS].
+    fn encode_with_marker(
+        &mut self,
+        text: &str,
+        marker_token_id: u32,
+    ) -> eyre::Result<sgrep_core::DocumentEmbedding> {
         let encoding = self
             .tokenizer
             .encode(text, true)
             .map_err(|e| eyre::eyre!("tokenization failed: {e}"))?;
 
-        let token_count = encoding.get_ids().len().min(MAX_SEQ_LENGTH);
+        let ids = encoding.get_ids();
+        // Token count: CLS + marker + text tokens (up to MAX_SEQ_LENGTH - 2 for CLS and marker)
+        let text_token_count = ids.len().saturating_sub(1).min(MAX_SEQ_LENGTH - 2);
+        let total_token_count = text_token_count + 2; // +2 for CLS and marker
 
-        // Prepare input tensors
+        // Prepare input tensors: [CLS] [Marker] [text tokens...] [padding...]
         let mut input_ids = vec![0u32; MAX_SEQ_LENGTH];
         let mut attention_mask = vec![0u32; MAX_SEQ_LENGTH];
 
-        for (i, &id) in encoding.get_ids().iter().take(MAX_SEQ_LENGTH).enumerate() {
-            input_ids[i] = id;
-            attention_mask[i] = 1;
+        // First token is CLS (from tokenizer)
+        if !ids.is_empty() {
+            input_ids[0] = ids[0]; // CLS token
+            attention_mask[0] = 1;
+        }
+
+        // Second token is the marker
+        input_ids[1] = marker_token_id;
+        attention_mask[1] = 1;
+
+        // Rest are text tokens (skip CLS from original)
+        for (i, &id) in ids.iter().skip(1).take(MAX_SEQ_LENGTH - 2).enumerate() {
+            input_ids[i + 2] = id;
+            attention_mask[i + 2] = 1;
         }
 
         let input_ids = candle_core::Tensor::from_vec(input_ids, (1, MAX_SEQ_LENGTH), &self.device)
@@ -128,20 +162,33 @@ impl ColBertEncoder {
             .next()
             .ok_or_else(|| eyre::eyre!("empty output"))?
             .into_iter()
-            .take(token_count)
+            .take(total_token_count)
             .map(l2_normalize)
             .collect();
 
-        Ok(sgrep_core::DocumentEmbedding::new(embeddings, model::JinaColBert::OUTPUT_DIM))
+        Ok(sgrep_core::DocumentEmbedding::new(
+            embeddings,
+            model::JinaColBert::OUTPUT_DIM,
+        ))
     }
 
-    /// Encode multiple texts in a batch.
-    pub fn encode_batch(
+    /// Encode multiple queries in a batch.
+    pub fn encode_queries(
         &mut self,
         texts: &[&str],
     ) -> eyre::Result<Vec<sgrep_core::DocumentEmbedding>> {
-        // For now, encode sequentially. Batch inference can be added later.
-        texts.iter().map(|text| self.encode(text)).collect()
+        texts.iter().map(|text| self.encode_query(text)).collect()
+    }
+
+    /// Encode multiple documents in a batch.
+    pub fn encode_documents(
+        &mut self,
+        texts: &[&str],
+    ) -> eyre::Result<Vec<sgrep_core::DocumentEmbedding>> {
+        texts
+            .iter()
+            .map(|text| self.encode_document(text))
+            .collect()
     }
 
     /// Get the device being used.
