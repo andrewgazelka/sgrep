@@ -21,6 +21,7 @@ sgrep-embed = { path = "crates/sgrep/embed" }
 sgrep-cas = { path = "crates/sgrep/cas" }
 sgrep-index = { path = "crates/sgrep/index" }
 sgrep-fusion = { path = "crates/sgrep/fusion" }
+sgrep-inference = { path = "crates/sgrep/inference" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -38,8 +39,9 @@ color-eyre = "0.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# CoreML / ML
-coreml = "0.2"
+# ONNX Runtime for ML inference (coreml for ANE acceleration on macOS)
+ort = { version = "2.0.0-rc.10", features = ["coreml"] }
+ndarray = "0.16"
 
 # Hashing
 blake3 = "1"

@@ -23,17 +23,20 @@ class JinaBertEncoder(torch.nn.Module):
         return outputs.last_hidden_state  # [batch, seq_len, hidden_dim]
 
 
-def convert_to_coreml(
+def convert_to_onnx(
     model_name: str,
     output_path: Path,
     max_seq_length: int = 512,
-) -> None:
-    """Convert a Jina ColBERT model to CoreML format.
+) -> Path:
+    """Convert a Jina ColBERT model to ONNX format.
 
     Args:
         model_name: HuggingFace model name (e.g., "jinaai/jina-colbert-v2")
-        output_path: Path to save the .mlpackage
+        output_path: Base path (will add .onnx extension)
         max_seq_length: Maximum sequence length for the model
+
+    Returns:
+        Path to the generated ONNX file
     """
     print(f"Loading model: {model_name}")
 
@@ -49,7 +52,7 @@ def convert_to_coreml(
     encoder = JinaBertEncoder(model)
     encoder.eval()
 
-    # Create dummy inputs for tracing
+    # Create dummy inputs for export
     dummy_text = "This is a sample input for tracing the model."
     inputs = tokenizer(
         dummy_text,
@@ -62,13 +65,50 @@ def convert_to_coreml(
     input_ids = inputs["input_ids"]
     attention_mask = inputs["attention_mask"]
 
-    print("Tracing model with torch.jit.trace...")
-    with torch.no_grad():
-        traced_model = torch.jit.trace(encoder, (input_ids, attention_mask))
+    onnx_path = output_path.with_suffix(".onnx")
+    onnx_path.parent.mkdir(parents=True, exist_ok=True)
 
-    print("Converting to CoreML...")
+    print(f"Exporting to ONNX: {onnx_path}")
+    with torch.no_grad():
+        torch.onnx.export(
+            encoder,
+            (input_ids, attention_mask),
+            str(onnx_path),
+            input_names=["input_ids", "attention_mask"],
+            output_names=["token_embeddings"],
+            dynamic_axes={
+                "input_ids": {0: "batch", 1: "seq_len"},
+                "attention_mask": {0: "batch", 1: "seq_len"},
+                "token_embeddings": {0: "batch", 1: "seq_len"},
+            },
+            opset_version=18,
+            do_constant_folding=True,
+        )
+
+    print(f"ONNX model saved to: {onnx_path}")
+    return onnx_path
+
+
+def convert_onnx_to_coreml(
+    onnx_path: Path,
+    output_path: Path,
+    max_seq_length: int = 512,
+) -> None:
+    """Convert an ONNX model to CoreML format.
+
+    Args:
+        onnx_path: Path to the ONNX model
+        output_path: Path to save the .mlpackage
+        max_seq_length: Maximum sequence length for the model
+    """
+    import onnx
+
+    print(f"Loading ONNX model: {onnx_path}")
+    onnx_model = onnx.load(str(onnx_path))
+
+    print("Converting ONNX to CoreML...")
     mlmodel = ct.convert(
-        traced_model,
+        onnx_model,
         inputs=[
             ct.TensorType(
                 name="input_ids",
@@ -90,13 +130,35 @@ def convert_to_coreml(
 
     # Add metadata
     mlmodel.author = "sgrep"
-    mlmodel.short_description = f"Jina BERT encoder ({model_name}) for token embeddings"
+    mlmodel.short_description = "Jina BERT encoder for token embeddings"
     mlmodel.version = "1.0"
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    print(f"Saving to: {output_path}")
+    print(f"Saving CoreML model to: {output_path}")
     mlmodel.save(str(output_path))
     print("Done!")
+
+
+def convert_to_coreml(
+    model_name: str,
+    output_path: Path,
+    max_seq_length: int = 512,
+) -> None:
+    """Convert a Jina ColBERT model to CoreML format via ONNX.
+
+    Args:
+        model_name: HuggingFace model name (e.g., "jinaai/jina-colbert-v2")
+        output_path: Path to save the .mlpackage
+        max_seq_length: Maximum sequence length for the model
+    """
+    # Step 1: Export to ONNX
+    onnx_path = convert_to_onnx(model_name, output_path, max_seq_length)
+
+    # Step 2: Convert ONNX to CoreML
+    convert_onnx_to_coreml(onnx_path, output_path, max_seq_length)
+
+    # Optionally remove ONNX intermediate file
+    # onnx_path.unlink()
 
 
 def main() -> None:
@@ -120,9 +182,18 @@ def main() -> None:
         default=512,
         help="Maximum sequence length",
     )
+    parser.add_argument(
+        "--onnx-only",
+        action="store_true",
+        help="Only export to ONNX (skip CoreML conversion)",
+    )
 
     args = parser.parse_args()
-    convert_to_coreml(args.model, args.output, args.max_seq_length)
+
+    if args.onnx_only:
+        convert_to_onnx(args.model, args.output, args.max_seq_length)
+    else:
+        convert_to_coreml(args.model, args.output, args.max_seq_length)
 
 
 if __name__ == "__main__":

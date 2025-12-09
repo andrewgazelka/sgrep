@@ -1,0 +1,156 @@
+//! ONNX Runtime inference for ColBERT token embeddings.
+//!
+//! This crate provides a wrapper around ONNX Runtime to run the Jina ColBERT
+//! model for generating per-token embeddings. On macOS, it uses the CoreML
+//! execution provider for ANE (Apple Neural Engine) acceleration.
+
+use eyre::WrapErr as _;
+use ort::execution_providers::coreml::{CoreMLComputeUnits, CoreMLExecutionProvider};
+use ort::execution_providers::ExecutionProvider as _;
+use ort::session::{builder::GraphOptimizationLevel, Session};
+
+const HIDDEN_DIM: usize = 1024;
+const MAX_SEQ_LENGTH: usize = 128;
+
+/// A ColBERT encoder that uses ONNX Runtime for inference.
+pub struct ColBertEncoder {
+    session: Session,
+    tokenizer: tokenizers::Tokenizer,
+}
+
+impl ColBertEncoder {
+    /// Load a ColBERT encoder from ONNX model and tokenizer files.
+    ///
+    /// On macOS, this will attempt to use CoreML/ANE for acceleration.
+    /// Falls back to CPU if CoreML is not available.
+    ///
+    /// # Arguments
+    /// * `model_path` - Path to the .onnx model file
+    /// * `tokenizer_path` - Path to the tokenizer.json file
+    pub fn load(
+        model_path: impl AsRef<std::path::Path>,
+        tokenizer_path: impl AsRef<std::path::Path>,
+    ) -> eyre::Result<Self> {
+        let model_path = model_path.as_ref();
+        let tokenizer_path = tokenizer_path.as_ref();
+
+        tracing::info!(?model_path, "loading ONNX model");
+
+        let mut builder = Session::builder()
+            .wrap_err("failed to create ONNX session builder")?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .wrap_err("failed to set optimization level")?;
+
+        // Try to register CoreML execution provider for ANE acceleration on macOS
+        let coreml = CoreMLExecutionProvider::default()
+            .with_compute_units(CoreMLComputeUnits::CPUAndNeuralEngine)  // Use ANE when available
+            .with_subgraphs(true);  // Enable subgraph partitioning for better compatibility
+
+        if coreml.register(&mut builder).is_ok() {
+            tracing::info!("CoreML execution provider registered (using ANE)");
+        } else {
+            tracing::warn!("CoreML not available, falling back to CPU");
+        }
+
+        let session = builder
+            .commit_from_file(model_path)
+            .wrap_err_with(|| format!("failed to load ONNX model from {model_path:?}"))?;
+
+        tracing::info!(?tokenizer_path, "loading tokenizer");
+
+        let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
+            .map_err(|e| eyre::eyre!("failed to load tokenizer from {tokenizer_path:?}: {e}"))?;
+
+        Ok(Self { session, tokenizer })
+    }
+
+    /// Encode text into a document embedding (per-token embeddings).
+    ///
+    /// Returns a `DocumentEmbedding` containing one embedding vector per token.
+    pub fn encode(&mut self, text: &str) -> eyre::Result<sgrep_core::DocumentEmbedding> {
+        let encoding = self
+            .tokenizer
+            .encode(text, true)
+            .map_err(|e| eyre::eyre!("tokenization failed: {e}"))?;
+
+        let token_count = encoding.get_ids().len().min(MAX_SEQ_LENGTH);
+
+        // Pad or truncate to MAX_SEQ_LENGTH
+        let mut input_ids = vec![0i64; MAX_SEQ_LENGTH];
+        let mut attention_mask = vec![0i64; MAX_SEQ_LENGTH];
+
+        for (i, &id) in encoding.get_ids().iter().take(MAX_SEQ_LENGTH).enumerate() {
+            input_ids[i] = i64::from(id);
+            attention_mask[i] = 1;
+        }
+
+        // Create input tensors using ort::value::Tensor
+        let input_ids_tensor = ort::value::Tensor::from_array((
+            vec![1, MAX_SEQ_LENGTH],
+            input_ids.into_boxed_slice(),
+        ))
+        .wrap_err("failed to create input_ids tensor")?;
+
+        let attention_mask_tensor = ort::value::Tensor::from_array((
+            vec![1, MAX_SEQ_LENGTH],
+            attention_mask.into_boxed_slice(),
+        ))
+        .wrap_err("failed to create attention_mask tensor")?;
+
+        // Run inference
+        let outputs = self
+            .session
+            .run(ort::inputs![
+                "input_ids" => input_ids_tensor,
+                "attention_mask" => attention_mask_tensor,
+            ])
+            .wrap_err("ONNX inference failed")?;
+
+        // Extract output tensor [1, seq_len, hidden_dim]
+        let output = outputs
+            .get("token_embeddings")
+            .ok_or_else(|| eyre::eyre!("model output 'token_embeddings' not found"))?;
+
+        let output_array = output
+            .try_extract_array::<f32>()
+            .wrap_err("failed to extract output tensor")?;
+
+        // Convert to Vec<Vec<f32>> - only take actual tokens (not padding)
+        let embeddings: Vec<Vec<f32>> = (0..token_count)
+            .map(|i| {
+                (0..HIDDEN_DIM)
+                    .map(|j| *output_array.get([0, i, j]).unwrap_or(&0.0))
+                    .collect()
+            })
+            .collect();
+
+        Ok(sgrep_core::DocumentEmbedding::new(embeddings, HIDDEN_DIM))
+    }
+
+    /// Encode multiple texts in a batch (more efficient than encoding one by one).
+    pub fn encode_batch(&mut self, texts: &[&str]) -> eyre::Result<Vec<sgrep_core::DocumentEmbedding>> {
+        // For now, just encode sequentially. Batch inference can be added later.
+        texts.iter().map(|text| self.encode(text)).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Tests require model files, so they're skipped in CI
+    // Run manually with: cargo test --package sgrep-inference -- --ignored
+
+    #[test]
+    #[ignore = "requires model files"]
+    fn test_encoder_load_and_inference() {
+        let mut encoder = super::ColBertEncoder::load(
+            "../../scripts/convert/models/jina-colbert-v2.onnx",
+            "tokenizer.json",
+        )
+        .expect("failed to load encoder");
+
+        let embedding = encoder.encode("Hello, world!").expect("encoding failed");
+
+        assert!(!embedding.embeddings.is_empty());
+        assert_eq!(embedding.dim, super::HIDDEN_DIM);
+    }
+}

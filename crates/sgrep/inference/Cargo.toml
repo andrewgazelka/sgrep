@@ -1,0 +1,22 @@
+[package]
+name = "sgrep-inference"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ONNX Runtime inference for ColBERT embeddings with CoreML/ANE acceleration"
+
+[dependencies]
+sgrep-core.workspace = true
+ort.workspace = true
+ndarray.workspace = true
+eyre.workspace = true
+tracing.workspace = true
+tokenizers.workspace = true
+
+[dev-dependencies]
+color-eyre.workspace = true
+tracing-subscriber.workspace = true
+sgrep-embed.workspace = true
+
+[lints]
+workspace = true
