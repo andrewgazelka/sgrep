@@ -12,6 +12,23 @@ use ort::session::{builder::GraphOptimizationLevel, Session};
 const HIDDEN_DIM: usize = 1024;
 const MAX_SEQ_LENGTH: usize = 128;
 
+/// Execution provider configuration for the encoder.
+///
+/// Benchmarks show CPU-only is fastest for Jina-ColBERT-v2 on Apple Silicon:
+/// - CpuOnly: ~200ms (FASTEST)
+/// - CoreMLAne: ~275ms (27% slower due to CPU<->ANE data transfer overhead)
+/// - CoreMLGpu: FAILS (unsupported ops)
+#[derive(Debug, Clone, Copy, Default)]
+pub enum ExecutionProvider {
+    /// CPU only - no hardware acceleration. FASTEST for this model.
+    #[default]
+    CpuOnly,
+    /// CoreML with CPU and GPU (no ANE). May fail on some models.
+    CoreMLGpu,
+    /// CoreML with CPU and ANE (Apple Neural Engine). Slower due to partial support.
+    CoreMLAne,
+}
+
 /// A ColBERT encoder that uses ONNX Runtime for inference.
 pub struct ColBertEncoder {
     session: Session,
@@ -19,10 +36,7 @@ pub struct ColBertEncoder {
 }
 
 impl ColBertEncoder {
-    /// Load a ColBERT encoder from ONNX model and tokenizer files.
-    ///
-    /// On macOS, this will attempt to use CoreML/ANE for acceleration.
-    /// Falls back to CPU if CoreML is not available.
+    /// Load a ColBERT encoder with the default execution provider (CoreML+ANE).
     ///
     /// # Arguments
     /// * `model_path` - Path to the .onnx model file
@@ -31,25 +45,57 @@ impl ColBertEncoder {
         model_path: impl AsRef<std::path::Path>,
         tokenizer_path: impl AsRef<std::path::Path>,
     ) -> eyre::Result<Self> {
+        Self::load_with_provider(model_path, tokenizer_path, ExecutionProvider::default())
+    }
+
+    /// Load a ColBERT encoder with a specific execution provider.
+    ///
+    /// # Arguments
+    /// * `model_path` - Path to the .onnx model file
+    /// * `tokenizer_path` - Path to the tokenizer.json file
+    /// * `provider` - Which execution provider to use
+    pub fn load_with_provider(
+        model_path: impl AsRef<std::path::Path>,
+        tokenizer_path: impl AsRef<std::path::Path>,
+        provider: ExecutionProvider,
+    ) -> eyre::Result<Self> {
         let model_path = model_path.as_ref();
         let tokenizer_path = tokenizer_path.as_ref();
 
-        tracing::info!(?model_path, "loading ONNX model");
+        tracing::info!(?model_path, ?provider, "loading ONNX model");
 
         let mut builder = Session::builder()
             .wrap_err("failed to create ONNX session builder")?
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .wrap_err("failed to set optimization level")?;
 
-        // Try to register CoreML execution provider for ANE acceleration on macOS
-        let coreml = CoreMLExecutionProvider::default()
-            .with_compute_units(CoreMLComputeUnits::CPUAndNeuralEngine)  // Use ANE when available
-            .with_subgraphs(true);  // Enable subgraph partitioning for better compatibility
+        // Register execution provider based on configuration
+        match provider {
+            ExecutionProvider::CpuOnly => {
+                tracing::info!("using CPU-only execution");
+            }
+            ExecutionProvider::CoreMLGpu => {
+                let coreml = CoreMLExecutionProvider::default()
+                    .with_compute_units(CoreMLComputeUnits::CPUAndGPU)
+                    .with_subgraphs(true);
 
-        if coreml.register(&mut builder).is_ok() {
-            tracing::info!("CoreML execution provider registered (using ANE)");
-        } else {
-            tracing::warn!("CoreML not available, falling back to CPU");
+                if coreml.register(&mut builder).is_ok() {
+                    tracing::info!("CoreML execution provider registered (CPU+GPU)");
+                } else {
+                    tracing::warn!("CoreML not available, falling back to CPU");
+                }
+            }
+            ExecutionProvider::CoreMLAne => {
+                let coreml = CoreMLExecutionProvider::default()
+                    .with_compute_units(CoreMLComputeUnits::CPUAndNeuralEngine)
+                    .with_subgraphs(true);
+
+                if coreml.register(&mut builder).is_ok() {
+                    tracing::info!("CoreML execution provider registered (CPU+ANE)");
+                } else {
+                    tracing::warn!("CoreML not available, falling back to CPU");
+                }
+            }
         }
 
         let session = builder
