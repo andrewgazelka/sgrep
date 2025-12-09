@@ -1,0 +1,146 @@
+[workspace]
+members = ["crates/sgrep/*", "crates/sgrep-cli"]
+resolver = "3"
+
+[workspace.package]
+authors = ["Andrew Gazelka <andrew.gazelka@gmail.com>"]
+categories = ["command-line-utilities", "text-processing"]
+description = "Semantic grep - combining BM25 and neural embeddings for code search"
+edition = "2024"
+exclude = ["assets/*", ".github"]
+keywords = ["search", "semantic", "grep", "embeddings"]
+license = "MIT"
+publish = false
+rust-version = "1.91.0"
+version = "0.1.0"
+
+[workspace.dependencies]
+# Internal crates
+sgrep-core = { path = "crates/sgrep/core" }
+sgrep-embed = { path = "crates/sgrep/embed" }
+sgrep-cas = { path = "crates/sgrep/cas" }
+sgrep-index = { path = "crates/sgrep/index" }
+sgrep-fusion = { path = "crates/sgrep/fusion" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+eyre = "0.6"
+color-eyre = "0.6"
+
+# Logging & Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CoreML / ML
+coreml = "0.2"
+
+# Hashing
+blake3 = "1"
+
+# Search
+tantivy = "0.22"
+
+# File traversal
+ignore = "0.4"
+walkdir = "2"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Tokenization
+tokenizers = "0.21"
+unicode-segmentation = "1"
+
+# Testing
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[workspace.lints.clippy]
+# Deny all categories by default
+complexity = { level = "deny", priority = -1 }
+correctness = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+style = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+
+# Allow casts (review case-by-case)
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+
+# Allow code style variations
+collapsible_if = "allow"
+doc_lazy_continuation = "allow"
+doc_markdown = "allow"
+many_single_char_names = "allow"
+match_same_arms = "allow"
+single_match_else = "allow"
+uninlined_format_args = "deny"
+
+# Allow missing documentation
+missing_const_for_fn = "allow"
+missing_docs_in_private_items = "allow"
+missing_errors_doc = "allow"
+
+# Allow design pattern variations
+future_not_send = "allow"
+must_use_candidate = "allow"
+needless_pass_by_value = "allow"
+option_if_let_else = "allow"
+significant_drop_tightening = "allow"
+struct_excessive_bools = "allow"
+
+# Allow misc
+multiple_crate_versions = "allow"
+similar_names = "allow"
+
+# Deny safety-critical lints
+char_indices_as_byte_indices = "deny"
+indexing_slicing = "deny"
+string_slice = "deny"
+
+# Deny code quality lints
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+cognitive_complexity = "deny"
+excessive_nesting = "deny"
+missing_panics_doc = "deny"
+print_stdout = "deny"
+
+[workspace.lints.rust]
+# Allow specific lints
+dead_code = "allow"
+mismatched_lifetime_syntaxes = "allow"
+
+# Deny categories
+deprecated_safe = { level = "deny", priority = -1 }
+future_incompatible = { level = "deny", priority = -1 }
+keyword_idents = { level = "deny", priority = -1 }
+rust_2018_idioms = { level = "deny", priority = -1 }
+
+# Warn on unsafe
+unsafe_code = "warn"
+
+# Config
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+
+[profile.release-full]
+inherits = "release"
+codegen-units = 1
+debug = false
+debug-assertions = false
+incremental = false
+lto = "fat"
+opt-level = "z"
+panic = "abort"
+rpath = false
+strip = true

@@ -1,0 +1,22 @@
+[package]
+name = "sgrep-embed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Embedding generation and ColBERT MaxSim scoring"
+
+[dependencies]
+sgrep-core.workspace = true
+eyre.workspace = true
+tracing.workspace = true
+tokenizers.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "maxsim"
+harness = false
+
+[lints]
+workspace = true

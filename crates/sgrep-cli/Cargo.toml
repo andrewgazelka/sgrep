@@ -1,0 +1,26 @@
+[package]
+name = "sgrep-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI for semantic grep"
+
+[[bin]]
+name = "sgrep"
+path = "src/main.rs"
+
+[dependencies]
+sgrep-core.workspace = true
+sgrep-embed.workspace = true
+sgrep-cas.workspace = true
+sgrep-index.workspace = true
+sgrep-fusion.workspace = true
+eyre.workspace = true
+color-eyre.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+ignore.workspace = true
+
+[lints]
+workspace = true

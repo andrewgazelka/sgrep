@@ -1,0 +1,9 @@
+[project]
+name = "sgrep"
+version = "0.1.0"
+description = "Semantic grep - combining BM25 and neural embeddings for code search"
+requires-python = ">=3.13"
+dependencies = []
+
+[tool.uv.workspace]
+members = ["scripts/*"]

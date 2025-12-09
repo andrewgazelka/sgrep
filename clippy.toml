@@ -1,0 +1,64 @@
+cognitive-complexity-threshold = 100
+excessive-nesting-threshold = 5
+msrv = "1.91.0"
+single-char-binding-names-threshold = 1
+too-many-lines-threshold = 100
+
+allow-expect-in-tests = true
+allow-unwrap-in-tests = true
+cargo-ignore-publish = true
+
+disallowed-types = [
+    { path = "anyhow::Result", reason = "use eyre::Result instead", replacement = "eyre::Result" },
+    { path = "anyhow::Error", reason = "use eyre::Report instead", replacement = "eyre::Report" },
+]
+
+disallowed-macros = [
+    { path = "println", reason = "use tracing crate instead (tracing::info!, tracing::debug!, etc.)", replacement = "tracing::info!" },
+    { path = "eprintln", reason = "use tracing crate instead (tracing::error!, tracing::warn!, etc.)", replacement = "tracing::error!" },
+]
+
+disallowed-methods = [
+    # Memory management - no leaking
+    { path = "std::vec::Vec::leak", reason = "no leaking memory" },
+    { path = "std::mem::forget", reason = "no leaking memory" },
+    { path = "std::boxed::Box::leak", reason = "no leaking memory" },
+
+    # Panic-inducing functions
+    { path = "std::panic::panic_any", reason = "use eyre::Result for error handling" },
+
+    # Async runtime - prevent nested runtime errors
+    { path = "tokio::runtime::Runtime::block_on", reason = "causes 'nested runtime' panics when called from async context. Restructure: make functions async and use spawn_blocking only at highest level" },
+    { path = "tokio::runtime::Handle::block_on", reason = "causes 'nested runtime' panics when called from async context. Restructure: make functions async and use spawn_blocking only at highest level" },
+
+    # Process operations
+    { path = "std::process::exit", reason = "prefer graceful shutdown patterns" },
+    { path = "std::process::abort", reason = "prefer graceful error handling" },
+]
+
+allowed-duplicate-crates = [
+    "getrandom",
+    "hashbrown",
+    "wasi",
+    "windows-sys",
+    "windows-targets",
+    "windows_aarch64_gnullvm",
+    "windows_aarch64_msvc",
+    "windows_i686_gnu",
+    "windows_i686_gnullvm",
+    "windows_i686_msvc",
+    "windows_x86_64_gnu",
+    "windows_x86_64_gnullvm",
+    "windows_x86_64_msvc",
+]
+
+doc-valid-idents = [
+    "CamelCase",
+    "CoreML",
+    "GitHub",
+    "HuggingFace",
+    "MaxSim",
+    "ColBERT",
+    "BM25",
+    "macOS",
+]

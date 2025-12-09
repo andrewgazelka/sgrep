@@ -1,0 +1,16 @@
+[package]
+name = "sgrep-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "BM25 index using tantivy"
+
+[dependencies]
+sgrep-core.workspace = true
+eyre.workspace = true
+tracing.workspace = true
+tantivy.workspace = true
+unicode-segmentation.workspace = true
+
+[lints]
+workspace = true
