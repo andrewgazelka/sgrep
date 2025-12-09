@@ -22,6 +22,7 @@ sgrep-cas = { path = "crates/sgrep/cas" }
 sgrep-index = { path = "crates/sgrep/index" }
 sgrep-fusion = { path = "crates/sgrep/fusion" }
 sgrep-inference = { path = "crates/sgrep/inference" }
+sgrep-candle = { path = "crates/sgrep/candle" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -58,6 +59,12 @@ clap = { version = "4", features = ["derive"] }
 
 # Tokenization
 tokenizers = "0.21"
+
+# Candle ML framework
+candle-core = "0.9"
+candle-nn = "0.9"
+candle-transformers = "0.9"
+hf-hub = "0.4"
 unicode-segmentation = "1"
 
 # Testing

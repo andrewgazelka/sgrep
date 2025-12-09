@@ -2,29 +2,15 @@ Execution Provider Benchmark Results
 =====================================
 
 Configuration: 3 warmup, 20 iterations, 5 texts
-Model: Jina-ColBERT-v2 (1024-dim, 128 max seq length)
-Hardware: Apple Silicon (M-series)
 
 Provider                Mean (ms)     P50 (ms)
 -------------------- ------------ ------------
-CpuOnly                    ~200         ~190
-CoreMLGpu                   FAILED (unsupported ops)
-CoreMLAne                  ~275         ~260
+CpuOnly                    288.16       274.05
+CoreMLAne                  459.54       424.31
+CoreMLGpuMLProgram        2173.69      2117.73
+CoreMLAneMLProgram         309.05       301.17
 
 Speedup vs CPU:
-  CoreMLAne: 0.73x (27% SLOWER than CPU)
-  CoreMLGpu: N/A - inference fails with error code -1
-
-CONCLUSION:
------------
-CPU-only is the FASTEST option for this model on Apple Silicon.
-
-The ANE path is slower because:
-1. Only 482/1158 nodes (42%) can run on ANE
-2. The large embedding table (250k x 1024) exceeds CoreML's 16384 dim limit
-3. Data transfer overhead between CPU<->ANE outweighs acceleration benefits
-
-The GPU path fails entirely - CoreML GPU mode doesn't support some ops
-that the ANE path handles.
-
-RECOMMENDATION: Use CpuOnly (ExecutionProvider::CpuOnly) for best performance.
+  CoreMLAne: 0.63x
+  CoreMLGpuMLProgram: 0.13x
+  CoreMLAneMLProgram: 0.93x

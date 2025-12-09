@@ -5,7 +5,9 @@
 //! execution provider for ANE (Apple Neural Engine) acceleration.
 
 use eyre::WrapErr as _;
-use ort::execution_providers::coreml::{CoreMLComputeUnits, CoreMLExecutionProvider};
+use ort::execution_providers::coreml::{
+    CoreMLComputeUnits, CoreMLExecutionProvider, CoreMLModelFormat,
+};
 use ort::execution_providers::ExecutionProvider as _;
 use ort::session::{builder::GraphOptimizationLevel, Session};
 
@@ -17,16 +19,22 @@ const MAX_SEQ_LENGTH: usize = 128;
 /// Benchmarks show CPU-only is fastest for Jina-ColBERT-v2 on Apple Silicon:
 /// - CpuOnly: ~200ms (FASTEST)
 /// - CoreMLAne: ~275ms (27% slower due to CPU<->ANE data transfer overhead)
-/// - CoreMLGpu: FAILS (unsupported ops)
+/// - CoreMLGpu: FAILS with NeuralNetwork format (unsupported ops)
+///
+/// MLProgram format (requires macOS 12+/iOS 15+) may have better GPU support.
 #[derive(Debug, Clone, Copy, Default)]
 pub enum ExecutionProvider {
     /// CPU only - no hardware acceleration. FASTEST for this model.
     #[default]
     CpuOnly,
-    /// CoreML with CPU and GPU (no ANE). May fail on some models.
+    /// CoreML with CPU and GPU using NeuralNetwork format. May fail on some models.
     CoreMLGpu,
-    /// CoreML with CPU and ANE (Apple Neural Engine). Slower due to partial support.
+    /// CoreML with CPU and ANE using NeuralNetwork format. Slower due to partial support.
     CoreMLAne,
+    /// CoreML with CPU and GPU using MLProgram format (macOS 12+). Better op support.
+    CoreMLGpuMLProgram,
+    /// CoreML with CPU and ANE using MLProgram format (macOS 12+). Better op support.
+    CoreMLAneMLProgram,
 }
 
 /// A ColBERT encoder that uses ONNX Runtime for inference.
@@ -80,7 +88,7 @@ impl ColBertEncoder {
                     .with_subgraphs(true);
 
                 if coreml.register(&mut builder).is_ok() {
-                    tracing::info!("CoreML execution provider registered (CPU+GPU)");
+                    tracing::info!("CoreML execution provider registered (CPU+GPU, NeuralNetwork)");
                 } else {
                     tracing::warn!("CoreML not available, falling back to CPU");
                 }
@@ -91,7 +99,31 @@ impl ColBertEncoder {
                     .with_subgraphs(true);
 
                 if coreml.register(&mut builder).is_ok() {
-                    tracing::info!("CoreML execution provider registered (CPU+ANE)");
+                    tracing::info!("CoreML execution provider registered (CPU+ANE, NeuralNetwork)");
+                } else {
+                    tracing::warn!("CoreML not available, falling back to CPU");
+                }
+            }
+            ExecutionProvider::CoreMLGpuMLProgram => {
+                let coreml = CoreMLExecutionProvider::default()
+                    .with_compute_units(CoreMLComputeUnits::CPUAndGPU)
+                    .with_model_format(CoreMLModelFormat::MLProgram)
+                    .with_subgraphs(true);
+
+                if coreml.register(&mut builder).is_ok() {
+                    tracing::info!("CoreML execution provider registered (CPU+GPU, MLProgram)");
+                } else {
+                    tracing::warn!("CoreML not available, falling back to CPU");
+                }
+            }
+            ExecutionProvider::CoreMLAneMLProgram => {
+                let coreml = CoreMLExecutionProvider::default()
+                    .with_compute_units(CoreMLComputeUnits::CPUAndNeuralEngine)
+                    .with_model_format(CoreMLModelFormat::MLProgram)
+                    .with_subgraphs(true);
+
+                if coreml.register(&mut builder).is_ok() {
+                    tracing::info!("CoreML execution provider registered (CPU+ANE, MLProgram)");
                 } else {
                     tracing::warn!("CoreML not available, falling back to CPU");
                 }

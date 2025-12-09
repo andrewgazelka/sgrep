@@ -2,6 +2,12 @@
 //!
 //! This crate provides a native Rust implementation of the Jina ColBERT v2 model
 //! using the Candle ML framework, with Metal GPU support on Apple Silicon.
+//!
+//! # References
+//!
+//! - Model: <https://huggingface.co/jinaai/jina-colbert-v2>
+//! - Paper: <https://aclanthology.org/2024.mrl-1.11/>
+//! - PyLate reference implementation: <https://github.com/lightonai/pylate>
 
 mod model;
 
@@ -13,9 +19,15 @@ pub use model::JinaColBertConfig;
 const MAX_SEQ_LENGTH: usize = 128;
 
 /// Token ID for [QueryMarker] in jina-colbert-v2 tokenizer.
+///
+/// ColBERT uses asymmetric encoding with different markers for queries vs documents.
+/// See: <https://github.com/lightonai/pylate/blob/main/pylate/models/colbert.py>
 const QUERY_MARKER_TOKEN_ID: u32 = 250002;
 
 /// Token ID for [DocumentMarker] in jina-colbert-v2 tokenizer.
+///
+/// The marker is inserted after [CLS] token: `[CLS] [Marker] text...`
+/// See: <https://github.com/lightonai/pylate/blob/main/pylate/models/colbert.py>
 const DOCUMENT_MARKER_TOKEN_ID: u32 = 250003;
 
 /// A ColBERT encoder using Candle with Metal GPU acceleration.

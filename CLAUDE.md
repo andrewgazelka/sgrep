@@ -30,6 +30,14 @@ Weight naming follows HuggingFace format:
 - `roberta.emb_ln.{weight,bias}` (embedding layer norm)
 - `linear.weight` (ColBERT projection, no bias)
 
+### Query/Document Encoding
+
+ColBERT uses asymmetric encoding with special marker tokens:
+- **Query**: `[CLS] [QueryMarker] text...` (token ID 250002)
+- **Document**: `[CLS] [DocumentMarker] text...` (token ID 250003)
+
+Reference implementation: https://github.com/lightonai/pylate
+
 ## Inference Backends
 
 ### Candle (Recommended)

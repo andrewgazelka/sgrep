@@ -2,6 +2,18 @@
 //!
 //! This is an XLM-RoBERTa variant with RoPE, flash attention style, and pre-norm.
 //! Weight naming follows the HuggingFace jina-colbert-v2 format.
+//!
+//! # Architecture
+//!
+//! - 24 transformer layers with pre-norm (norm before attention/mlp)
+//! - Combined Q/K/V projection (`Wqkv`) instead of separate projections
+//! - Rotary Position Embeddings (RoPE) instead of absolute position embeddings
+//! - Output projection to 128 dimensions for ColBERT late interaction
+//!
+//! # References
+//!
+//! - Model weights: <https://huggingface.co/jinaai/jina-colbert-v2>
+//! - Paper: Jina-ColBERT-v2 (MRL 2024) <https://aclanthology.org/2024.mrl-1.11/>
 
 use candle_core::{Device, Result, Tensor};
 use candle_nn::{Embedding, Linear, Module, VarBuilder};

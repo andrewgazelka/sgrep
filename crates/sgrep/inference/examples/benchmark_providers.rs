@@ -99,6 +99,8 @@ fn main() -> eyre::Result<()> {
         sgrep_inference::ExecutionProvider::CpuOnly,
         sgrep_inference::ExecutionProvider::CoreMLGpu,
         sgrep_inference::ExecutionProvider::CoreMLAne,
+        sgrep_inference::ExecutionProvider::CoreMLGpuMLProgram,
+        sgrep_inference::ExecutionProvider::CoreMLAneMLProgram,
     ];
 
     for provider in providers {
