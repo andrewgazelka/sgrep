@@ -3,6 +3,9 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/andrewgazelka/sgrep/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="MIT License"/></a>
+  <img src="https://img.shields.io/badge/platform-macOS%20M--series-black?style=flat-square&logo=apple" alt="macOS M-series"/>
+  <img src="https://img.shields.io/badge/rust-1.91+-orange?style=flat-square&logo=rust" alt="Rust 1.91+"/>
   <a href="https://github.com/andrewgazelka/sgrep/issues"><img src="https://img.shields.io/github/issues/andrewgazelka/sgrep?style=flat-square" alt="GitHub Issues"/></a>
 </p>
 
