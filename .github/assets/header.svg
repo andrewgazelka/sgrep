@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 180">
+  <style>
+    .title { fill: #1f2328; }
+    .subtitle { fill: #656d76; }
+    .accent { fill: #6366f1; }
+    .icon { fill: #656d76; }
+    .dot { fill: #6366f1; }
+
+    @media (prefers-color-scheme: dark) {
+      .title { fill: #ffffff; }
+      .subtitle { fill: #8b949e; }
+      .icon { fill: #8b949e; }
+    }
+
+    .dot1 { animation: pulse 2s ease-in-out infinite; }
+    .dot2 { animation: pulse 2s ease-in-out infinite 0.3s; }
+    .dot3 { animation: pulse 2s ease-in-out infinite 0.6s; }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 0.3; }
+      50% { opacity: 1; }
+    }
+  </style>
+
+  <!-- Search icon with neural network dots -->
+  <g transform="translate(60, 50)">
+    <!-- Magnifying glass -->
+    <circle class="icon" cx="32" cy="32" r="24" fill="none" stroke-width="6" stroke="currentColor" style="stroke: #656d76"/>
+    <line class="icon" x1="50" y1="50" x2="70" y2="70" stroke-width="6" stroke-linecap="round" style="stroke: #656d76"/>
+
+    <!-- Neural dots inside the glass -->
+    <circle class="dot dot1" cx="24" cy="26" r="5"/>
+    <circle class="dot dot2" cx="40" cy="26" r="5"/>
+    <circle class="dot dot3" cx="32" cy="40" r="5"/>
+
+    <!-- Connection lines -->
+    <line class="accent" x1="24" y1="26" x2="40" y2="26" stroke-width="2" opacity="0.4" style="stroke: #6366f1"/>
+    <line class="accent" x1="24" y1="26" x2="32" y2="40" stroke-width="2" opacity="0.4" style="stroke: #6366f1"/>
+    <line class="accent" x1="40" y1="26" x2="32" y2="40" stroke-width="2" opacity="0.4" style="stroke: #6366f1"/>
+  </g>
+
+  <!-- Dark mode version of search icon -->
+  <style>
+    @media (prefers-color-scheme: dark) {
+      .icon-stroke { stroke: #8b949e !important; }
+    }
+  </style>
+  <g transform="translate(60, 50)">
+    <circle cx="32" cy="32" r="24" fill="none" stroke-width="6" class="icon-stroke" style="stroke: #656d76"/>
+    <line x1="50" y1="50" x2="70" y2="70" stroke-width="6" stroke-linecap="round" class="icon-stroke" style="stroke: #656d76"/>
+  </g>
+
+  <!-- Title -->
+  <text class="title" x="170" y="85" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="64" font-weight="700">sgrep</text>
+
+  <!-- Subtitle -->
+  <text class="subtitle" x="170" y="120" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="18">Semantic grep with ColBERT late interaction</text>
+</svg>
