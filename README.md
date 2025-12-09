@@ -3,6 +3,10 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/andrewgazelka/sgrep/issues"><img src="https://img.shields.io/github/issues/andrewgazelka/sgrep?style=flat-square" alt="GitHub Issues"/></a>
+</p>
+
+<p align="center">
   <code>cargo install --git https://github.com/andrewgazelka/sgrep</code>
 </p>
 
@@ -70,3 +74,4 @@ Uses [Jina ColBERT v2](https://huggingface.co/jinaai/jina-colbert-v2), an XLM-Ro
 | ONNX CoreML | ~459ms |
 
 </details>
+
