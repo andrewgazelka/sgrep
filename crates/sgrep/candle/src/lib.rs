@@ -192,17 +192,125 @@ impl ColBertEncoder {
         Ok(embedding)
     }
 
-    /// Encode multiple queries in a batch.
-    pub fn encode_queries(&mut self, texts: &[&str]) -> eyre::Result<Vec<sgrep_core::Embedding>> {
-        texts.iter().map(|text| self.encode_query(text)).collect()
+    /// Encode multiple queries in a single batched GPU call.
+    pub fn encode_queries_batch(&mut self, texts: &[&str]) -> eyre::Result<Vec<sgrep_core::Embedding>> {
+        self.encode_batch_with_marker(texts, QUERY_MARKER_TOKEN_ID)
     }
 
-    /// Encode multiple documents in a batch.
-    pub fn encode_documents(&mut self, texts: &[&str]) -> eyre::Result<Vec<sgrep_core::Embedding>> {
-        texts
-            .iter()
-            .map(|text| self.encode_document(text))
-            .collect()
+    /// Encode multiple documents in a single batched GPU call.
+    ///
+    /// This is much faster than calling `encode_document` in a loop because:
+    /// 1. Single GPU kernel launch instead of N launches
+    /// 2. Better GPU utilization through parallel processing
+    /// 3. Amortized memory transfer overhead
+    pub fn encode_documents_batch(&mut self, texts: &[&str]) -> eyre::Result<Vec<sgrep_core::Embedding>> {
+        self.encode_batch_with_marker(texts, DOCUMENT_MARKER_TOKEN_ID)
+    }
+
+    /// Encode a batch of texts with the same marker token.
+    fn encode_batch_with_marker(
+        &mut self,
+        texts: &[&str],
+        marker_token_id: u32,
+    ) -> eyre::Result<Vec<sgrep_core::Embedding>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let batch_size = texts.len();
+
+        // Tokenize all texts and track their actual token counts
+        let mut all_input_ids = Vec::with_capacity(batch_size * MAX_SEQ_LENGTH);
+        let mut all_attention_mask = Vec::with_capacity(batch_size * MAX_SEQ_LENGTH);
+        let mut token_counts = Vec::with_capacity(batch_size);
+
+        for text in texts {
+            let encoding = self
+                .tokenizer
+                .encode(*text, true)
+                .map_err(|e| eyre::eyre!("tokenization failed: {e}"))?;
+
+            let ids = encoding.get_ids();
+            let text_token_count = ids.len().saturating_sub(1).min(MAX_SEQ_LENGTH - 2);
+            let total_token_count = text_token_count + 2; // +2 for CLS and marker
+            token_counts.push(total_token_count);
+
+            let mut input_ids = vec![0u32; MAX_SEQ_LENGTH];
+            let mut attention_mask = vec![0u32; MAX_SEQ_LENGTH];
+
+            // CLS token
+            if !ids.is_empty() {
+                input_ids[0] = ids[0];
+                attention_mask[0] = 1;
+            }
+
+            // Marker token
+            input_ids[1] = marker_token_id;
+            attention_mask[1] = 1;
+
+            // Text tokens
+            for (i, &id) in ids.iter().skip(1).take(MAX_SEQ_LENGTH - 2).enumerate() {
+                input_ids[i + 2] = id;
+                attention_mask[i + 2] = 1;
+            }
+
+            all_input_ids.extend(input_ids);
+            all_attention_mask.extend(attention_mask);
+        }
+
+        // Create batched tensors [batch_size, seq_len]
+        let input_ids = candle_core::Tensor::from_vec(
+            all_input_ids,
+            (batch_size, MAX_SEQ_LENGTH),
+            &self.device,
+        )
+        .wrap_err("failed to create batched input_ids tensor")?;
+
+        let attention_mask = candle_core::Tensor::from_vec(
+            all_attention_mask,
+            (batch_size, MAX_SEQ_LENGTH),
+            &self.device,
+        )
+        .wrap_err("failed to create batched attention_mask tensor")?;
+
+        // Single forward pass for entire batch
+        let output = self
+            .model
+            .forward(&input_ids, &attention_mask)
+            .wrap_err("batched model forward pass failed")?;
+
+        // Convert to CPU
+        let output = output
+            .to_dtype(candle_core::DType::F32)
+            .wrap_err("failed to convert output to f32")?
+            .to_device(&candle_core::Device::Cpu)
+            .wrap_err("failed to move output to CPU")?;
+
+        // Shape: [batch_size, seq_len, embedding_dim]
+        let output_vec = output
+            .to_vec3::<f32>()
+            .wrap_err("failed to convert output to vec")?;
+
+        // Extract embeddings for each item in batch
+        let mut results = Vec::with_capacity(batch_size);
+
+        for (batch_output, &token_count) in output_vec.into_iter().zip(token_counts.iter()) {
+            let mut embedding = ndarray::Array2::zeros((token_count, sgrep_core::EMBEDDING_DIM));
+
+            for (i, token_emb) in batch_output.into_iter().take(token_count).enumerate() {
+                // L2 normalize
+                let norm: f32 = token_emb.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let norm = if norm > 0.0 { norm } else { 1.0 };
+
+                for (j, val) in token_emb.into_iter().enumerate() {
+                    embedding[[i, j]] = val / norm;
+                }
+            }
+
+            results.push(embedding);
+        }
+
+        Ok(results)
     }
 
     /// Get the device being used.

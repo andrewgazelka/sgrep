@@ -435,76 +435,126 @@ fn index(path: &std::path::Path) -> eyre::Result<()> {
     let mut store = sgrep_cas::EmbeddingStore::open(embeddings_path.clone())
         .wrap_err_with(|| format!("failed to create embedding store at {embeddings_path:?}"))?;
 
-    // Phase 4: Index with progress bar
-    let progress = ProgressBar::new(files.len() as u64);
-    progress.set_style(
+    // Phase 4: BM25 indexing (fast, sequential)
+    let bm25_progress = ProgressBar::new(files.len() as u64);
+    bm25_progress.set_style(
         ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}) {msg}")
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}) BM25: {msg}")
             .wrap_err("invalid progress bar template")?
             .progress_chars("█▓░"),
     );
 
-    let mut embedded_count = 0_u64;
+    // Track which files need embedding
+    struct FileToEmbed<'a> {
+        path: &'a str,
+        content: &'a str,
+        hash: sgrep_cas::ContentHash,
+    }
+
+    let mut files_to_embed: Vec<FileToEmbed<'_>> = Vec::new();
     let mut cached_count = 0_u64;
-    let mut encode_errors = 0_u64;
-    let start_time = std::time::Instant::now();
 
     for file in &files {
-        // Safe: we verified UTF-8 above
         let content_str = std::str::from_utf8(&file.content_bytes)
             .expect("already verified as UTF-8");
 
-        // Index in BM25
+        // BM25 indexing
         bm25_index
             .add_document(&file.relative_path, content_str)
             .wrap_err_with(|| format!("failed to add {} to BM25 index", file.relative_path))?;
 
-        // Compute and store embeddings (skip if already cached)
+        // Check if embedding is cached
         let hash = sgrep_cas::ContentHash::from_content(&file.content_bytes);
-        if !store.has_embeddings(&hash) {
-            match encoder.encode_document(content_str) {
-                Ok(embedding) => {
-                    store
-                        .store_embeddings(&hash, embedding.view())
-                        .wrap_err_with(|| {
-                            format!("failed to store embeddings for {}", file.relative_path)
-                        })?;
-                    embedded_count += 1;
-                }
-                Err(e) => {
-                    encode_errors += 1;
-                    tracing::warn!(path = %file.relative_path, ?e, "failed to encode document");
-                }
-            }
-        } else {
+        if store.has_embeddings(&hash) {
             cached_count += 1;
+        } else {
+            files_to_embed.push(FileToEmbed {
+                path: &file.relative_path,
+                content: content_str,
+                hash,
+            });
         }
 
-        progress.set_message(file.relative_path.clone());
-        progress.inc(1);
+        bm25_progress.set_message(file.relative_path.clone());
+        bm25_progress.inc(1);
+    }
+    bm25_progress.finish_and_clear();
+
+    // Phase 5: Batched GPU embedding
+    let mut embedded_count = 0_u64;
+    let mut encode_errors = 0_u64;
+    let start_time = std::time::Instant::now();
+
+    if !files_to_embed.is_empty() {
+        const BATCH_SIZE: usize = 16;
+
+        let embed_progress = ProgressBar::new(files_to_embed.len() as u64);
+        embed_progress.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}) Embedding: {msg}")
+                .wrap_err("invalid progress bar template")?
+                .progress_chars("█▓░"),
+        );
+
+        for chunk in files_to_embed.chunks(BATCH_SIZE) {
+            let texts: Vec<&str> = chunk.iter().map(|f| f.content).collect();
+
+            // Show first file in batch
+            if let Some(first) = chunk.first() {
+                embed_progress.set_message(format!("{} (+{})", first.path, chunk.len().saturating_sub(1)));
+            }
+
+            match encoder.encode_documents_batch(&texts) {
+                Ok(embeddings) => {
+                    for (file, embedding) in chunk.iter().zip(embeddings.into_iter()) {
+                        store
+                            .store_embeddings(&file.hash, embedding.view())
+                            .wrap_err_with(|| format!("failed to store embeddings for {}", file.path))?;
+                        embedded_count += 1;
+                    }
+                }
+                Err(e) => {
+                    // Batch failed, try individually to isolate bad files
+                    tracing::warn!(?e, "batch encoding failed, falling back to individual encoding");
+                    for file in chunk {
+                        match encoder.encode_document(file.content) {
+                            Ok(embedding) => {
+                                store.store_embeddings(&file.hash, embedding.view())?;
+                                embedded_count += 1;
+                            }
+                            Err(e) => {
+                                encode_errors += 1;
+                                tracing::warn!(path = %file.path, ?e, "failed to encode document");
+                            }
+                        }
+                    }
+                }
+            }
+
+            embed_progress.inc(chunk.len() as u64);
+        }
+        embed_progress.finish_and_clear();
     }
 
     let elapsed = start_time.elapsed();
-    progress.finish_and_clear();
 
     // Final summary
-    let total = files.len() as u64;
-    let files_per_sec = if elapsed.as_secs_f64() > 0.0 {
-        total as f64 / elapsed.as_secs_f64()
-    } else {
-        0.0
-    };
+    let total_files = files.len() as u64;
+    println!("Indexed {total_files} files");
 
-    println!(
-        "Indexed {} files in {:.1}s ({:.1} files/sec)",
-        total,
-        elapsed.as_secs_f64(),
-        files_per_sec
-    );
-    println!(
-        "  Embeddings: {} new, {} cached",
-        embedded_count, cached_count
-    );
+    if embedded_count > 0 {
+        let embed_per_sec = embedded_count as f64 / elapsed.as_secs_f64();
+        println!(
+            "  Embeddings: {} new in {:.1}s ({:.1}/sec), {} cached",
+            embedded_count,
+            elapsed.as_secs_f64(),
+            embed_per_sec,
+            cached_count
+        );
+    } else if cached_count > 0 {
+        println!("  Embeddings: {} cached (all up to date)", cached_count);
+    }
+
     if encode_errors > 0 {
         println!("  Encode errors: {encode_errors}");
     }
