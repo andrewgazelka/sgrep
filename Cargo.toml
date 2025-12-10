@@ -57,6 +57,9 @@ walkdir = "2"
 clap = { version = "4", features = ["derive"] }
 indicatif = "0.18"
 
+# Parallelism
+rayon = "1.11"
+
 # Tokenization
 tokenizers = "0.21"
 

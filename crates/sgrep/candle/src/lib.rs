@@ -213,24 +213,31 @@ impl ColBertEncoder {
         texts: &[&str],
         marker_token_id: u32,
     ) -> eyre::Result<Vec<sgrep_core::Embedding>> {
+        use rayon::prelude::*;
+
         if texts.is_empty() {
             return Ok(Vec::new());
         }
 
         let batch_size = texts.len();
 
+        // Parallel tokenization using rayon
+        let tokenized: Vec<_> = texts
+            .par_iter()
+            .map(|text| {
+                self.tokenizer
+                    .encode(*text, true)
+                    .map_err(|e| eyre::eyre!("tokenization failed: {e}"))
+            })
+            .collect::<eyre::Result<Vec<_>>>()?;
+
         // Pre-allocate contiguous buffers (zeros act as padding)
         let mut all_input_ids = vec![0u32; batch_size * MAX_SEQ_LENGTH];
         let mut all_attention_mask = vec![0u32; batch_size * MAX_SEQ_LENGTH];
         let mut token_counts = Vec::with_capacity(batch_size);
 
-        // Tokenize each text (sequential but writes directly to pre-allocated buffer)
-        for (idx, text) in texts.iter().enumerate() {
-            let encoding = self
-                .tokenizer
-                .encode(*text, true)
-                .map_err(|e| eyre::eyre!("tokenization failed: {e}"))?;
-
+        // Fill buffers from tokenized results
+        for (idx, encoding) in tokenized.iter().enumerate() {
             let ids = encoding.get_ids();
             let text_token_count = ids.len().saturating_sub(1).min(MAX_SEQ_LENGTH - 2);
             let total_token_count = text_token_count + 2; // +2 for CLS and marker
@@ -276,7 +283,21 @@ impl ColBertEncoder {
             .forward(&input_ids, &attention_mask)
             .wrap_err("batched model forward pass failed")?;
 
-        // Convert to CPU
+        // GPU-side L2 normalization: norm = sqrt(sum(x^2)), normalized = x / norm
+        // Shape: [batch_size, seq_len, embedding_dim]
+        let output_squared = output.sqr().wrap_err("failed to square output")?;
+        let norms = output_squared
+            .sum_keepdim(2)
+            .wrap_err("failed to sum for norms")?
+            .sqrt()
+            .wrap_err("failed to sqrt norms")?
+            .clamp(1e-12, f64::INFINITY)
+            .wrap_err("failed to clamp norms")?;
+        let output = output
+            .broadcast_div(&norms)
+            .wrap_err("failed to normalize")?;
+
+        // Convert to CPU after normalization
         let output = output
             .to_dtype(candle_core::DType::F32)
             .wrap_err("failed to convert output to f32")?
@@ -288,24 +309,23 @@ impl ColBertEncoder {
             .to_vec3::<f32>()
             .wrap_err("failed to convert output to vec")?;
 
-        // Extract embeddings for each item in batch
-        let mut results = Vec::with_capacity(batch_size);
+        // Extract embeddings for each item in batch (parallel)
+        let results: Vec<_> = output_vec
+            .into_par_iter()
+            .zip(token_counts.par_iter())
+            .map(|(batch_output, &token_count)| {
+                let mut embedding =
+                    ndarray::Array2::zeros((token_count, sgrep_core::EMBEDDING_DIM));
 
-        for (batch_output, &token_count) in output_vec.into_iter().zip(token_counts.iter()) {
-            let mut embedding = ndarray::Array2::zeros((token_count, sgrep_core::EMBEDDING_DIM));
-
-            for (i, token_emb) in batch_output.into_iter().take(token_count).enumerate() {
-                // L2 normalize
-                let norm: f32 = token_emb.iter().map(|x| x * x).sum::<f32>().sqrt();
-                let norm = if norm > 0.0 { norm } else { 1.0 };
-
-                for (j, val) in token_emb.into_iter().enumerate() {
-                    embedding[[i, j]] = val / norm;
+                for (i, token_emb) in batch_output.into_iter().take(token_count).enumerate() {
+                    for (j, val) in token_emb.into_iter().enumerate() {
+                        embedding[[i, j]] = val;
+                    }
                 }
-            }
 
-            results.push(embedding);
-        }
+                embedding
+            })
+            .collect();
 
         Ok(results)
     }

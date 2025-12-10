@@ -3200,6 +3200,7 @@ dependencies = [
  "eyre",
  "hf-hub",
  "ndarray",
+ "rayon",
  "serde",
  "serde_json",
  "sgrep-core",

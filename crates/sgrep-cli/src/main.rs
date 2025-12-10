@@ -486,7 +486,11 @@ fn index(path: &std::path::Path) -> eyre::Result<()> {
     let start_time = std::time::Instant::now();
 
     if !files_to_embed.is_empty() {
-        const BATCH_SIZE: usize = 16;
+        // Dynamic batching: pack files by estimated token count
+        // Max 32 files or ~4096 total tokens per batch (whichever comes first)
+        const MAX_BATCH_FILES: usize = 32;
+        const MAX_BATCH_TOKENS: usize = 4096;
+        const CHARS_PER_TOKEN: usize = 4; // rough estimate
 
         let embed_progress = ProgressBar::new(files_to_embed.len() as u64);
         embed_progress.set_style(
@@ -496,12 +500,35 @@ fn index(path: &std::path::Path) -> eyre::Result<()> {
                 .progress_chars("█▓░"),
         );
 
-        for chunk in files_to_embed.chunks(BATCH_SIZE) {
+        let mut batch_start = 0;
+        while batch_start < files_to_embed.len() {
+            // Build batch dynamically based on estimated token count
+            let mut batch_end = batch_start;
+            let mut batch_tokens = 0;
+
+            while batch_end < files_to_embed.len() {
+                let file = &files_to_embed[batch_end];
+                let est_tokens = file.content.len() / CHARS_PER_TOKEN;
+
+                // Stop if adding this file would exceed limits (unless batch is empty)
+                if batch_end > batch_start
+                    && (batch_end - batch_start >= MAX_BATCH_FILES
+                        || batch_tokens + est_tokens > MAX_BATCH_TOKENS)
+                {
+                    break;
+                }
+
+                batch_tokens += est_tokens;
+                batch_end += 1;
+            }
+
+            let chunk = &files_to_embed[batch_start..batch_end];
             let texts: Vec<&str> = chunk.iter().map(|f| f.content).collect();
 
-            // Show first file in batch
+            // Show batch info
             if let Some(first) = chunk.first() {
-                embed_progress.set_message(format!("{} (+{})", first.path, chunk.len().saturating_sub(1)));
+                embed_progress
+                    .set_message(format!("{} (+{}, ~{}tok)", first.path, chunk.len().saturating_sub(1), batch_tokens));
             }
 
             match encoder.encode_documents_batch(&texts) {
@@ -532,6 +559,7 @@ fn index(path: &std::path::Path) -> eyre::Result<()> {
             }
 
             embed_progress.inc(chunk.len() as u64);
+            batch_start = batch_end;
         }
         embed_progress.finish_and_clear();
     }
