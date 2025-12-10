@@ -6,9 +6,21 @@ use tantivy::schema::Value as _;
 /// A BM25 search index for code files.
 pub struct Bm25Index {
     index: tantivy::Index,
-    schema: tantivy::schema::Schema,
     content_field: tantivy::schema::Field,
     path_field: tantivy::schema::Field,
+}
+
+/// Build the code tokenizer pipeline:
+/// SimpleTokenizer -> CamelCaseSplitter -> LowerCaser -> Stemmer (English) -> RemoveLong
+fn build_code_tokenizer() -> tantivy::tokenizer::TextAnalyzer {
+    tantivy::tokenizer::TextAnalyzer::builder(tantivy::tokenizer::SimpleTokenizer::default())
+        .filter(CamelCaseSplitter)
+        .filter(tantivy::tokenizer::LowerCaser)
+        .filter(tantivy::tokenizer::Stemmer::new(
+            tantivy::tokenizer::Language::English,
+        ))
+        .filter(tantivy::tokenizer::RemoveLongFilter::limit(40))
+        .build()
 }
 
 impl Bm25Index {
@@ -31,14 +43,13 @@ impl Bm25Index {
         let content_field = schema_builder.add_text_field("content", text_options);
 
         let schema = schema_builder.build();
-        let index = tantivy::Index::create_in_ram(schema.clone());
+        let index = tantivy::Index::create_in_ram(schema);
 
-        // Register code tokenizer
-        index.tokenizers().register("code", CodeTokenizer);
+        // Register code tokenizer pipeline
+        index.tokenizers().register("code", build_code_tokenizer());
 
         Ok(Self {
             index,
-            schema,
             content_field,
             path_field,
         })
@@ -66,14 +77,13 @@ impl Bm25Index {
         let schema = schema_builder.build();
         let dir = tantivy::directory::MmapDirectory::open(path)
             .wrap_err_with(|| format!("failed to open mmap directory at {}", path.display()))?;
-        let index = tantivy::Index::open_or_create(dir, schema.clone())
+        let index = tantivy::Index::open_or_create(dir, schema)
             .wrap_err("failed to open or create index")?;
 
-        index.tokenizers().register("code", CodeTokenizer);
+        index.tokenizers().register("code", build_code_tokenizer());
 
         Ok(Self {
             index,
-            schema,
             content_field,
             path_field,
         })
@@ -85,8 +95,6 @@ impl Bm25Index {
         &self,
         documents: impl IntoIterator<Item = (&'a str, &'a str)>,
     ) -> eyre::Result<()> {
-        use eyre::WrapErr as _;
-
         let mut writer = self
             .index
             .writer(50_000_000)
@@ -147,89 +155,125 @@ impl Bm25Index {
     }
 }
 
-/// Custom tokenizer for code that handles camelCase, snake_case, etc.
-#[derive(Clone, Default)]
-pub struct CodeTokenizer;
+/// Token filter that splits camelCase and PascalCase into separate tokens.
+/// e.g., "getUserName" -> "get", "User", "Name"
+#[derive(Clone)]
+struct CamelCaseSplitter;
 
-impl tantivy::tokenizer::Tokenizer for CodeTokenizer {
-    type TokenStream<'a> = CodeTokenStream<'a>;
+impl tantivy::tokenizer::TokenFilter for CamelCaseSplitter {
+    type Tokenizer<T: tantivy::tokenizer::Tokenizer> = CamelCaseSplitterFilter<T>;
 
-    fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
-        CodeTokenStream::new(text)
+    fn transform<T: tantivy::tokenizer::Tokenizer>(self, tokenizer: T) -> Self::Tokenizer<T> {
+        CamelCaseSplitterFilter { inner: tokenizer }
     }
 }
 
-/// Token stream that splits on word boundaries and handles code conventions.
-pub struct CodeTokenStream<'a> {
-    text: &'a str,
-    tokens: Vec<(usize, usize, String)>, // (start, end, lowercase token)
-    index: usize,
-    token: tantivy::tokenizer::Token,
+#[derive(Clone)]
+struct CamelCaseSplitterFilter<T> {
+    inner: T,
 }
 
-impl<'a> CodeTokenStream<'a> {
-    fn new(text: &'a str) -> Self {
-        let tokens = tokenize_code(text);
-        Self {
-            text,
-            tokens,
-            index: 0,
-            token: tantivy::tokenizer::Token::default(),
+impl<T: tantivy::tokenizer::Tokenizer> tantivy::tokenizer::Tokenizer for CamelCaseSplitterFilter<T> {
+    type TokenStream<'a> = CamelCaseSplitterStream<'a, T::TokenStream<'a>>;
+
+    fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
+        CamelCaseSplitterStream {
+            inner: self.inner.token_stream(text),
+            pending_tokens: Vec::new(),
+            current_token: tantivy::tokenizer::Token::default(),
+            position: 0,
+            _phantom: std::marker::PhantomData,
         }
     }
 }
 
-impl tantivy::tokenizer::TokenStream for CodeTokenStream<'_> {
+struct CamelCaseSplitterStream<'a, T> {
+    inner: T,
+    pending_tokens: Vec<(usize, usize, String)>,
+    current_token: tantivy::tokenizer::Token,
+    position: usize,
+    _phantom: std::marker::PhantomData<&'a ()>,
+}
+
+impl<T: tantivy::tokenizer::TokenStream> tantivy::tokenizer::TokenStream
+    for CamelCaseSplitterStream<'_, T>
+{
     fn advance(&mut self) -> bool {
-        if self.index >= self.tokens.len() {
+        // First, drain any pending tokens from camelCase splitting
+        if let Some((offset_from, offset_to, text)) = self.pending_tokens.pop() {
+            self.current_token.offset_from = offset_from;
+            self.current_token.offset_to = offset_to;
+            self.current_token.position = self.position;
+            self.current_token.text.clear();
+            self.current_token.text.push_str(&text);
+            self.position += 1;
+            return true;
+        }
+
+        // Get next token from inner stream
+        if !self.inner.advance() {
             return false;
         }
 
-        let (start, end, ref text) = self.tokens[self.index];
-        self.token.offset_from = start;
-        self.token.offset_to = end;
-        self.token.position = self.index;
-        self.token.text.clear();
-        self.token.text.push_str(text);
-        self.index += 1;
+        let token = self.inner.token();
+        let text = &token.text;
+        let base_offset = token.offset_from;
+
+        // Split on camelCase boundaries
+        let splits = split_camel_case(text);
+
+        if splits.len() <= 1 {
+            // No splitting needed, just pass through
+            self.current_token.offset_from = token.offset_from;
+            self.current_token.offset_to = token.offset_to;
+            self.current_token.position = self.position;
+            self.current_token.text.clear();
+            self.current_token.text.push_str(text);
+            self.position += 1;
+            return true;
+        }
+
+        // Multiple tokens from camelCase split - push all but first to pending (reversed)
+        for (start, end, word) in splits.into_iter().rev() {
+            self.pending_tokens
+                .push((base_offset + start, base_offset + end, word));
+        }
+
+        // Pop the first one to return now
+        let (offset_from, offset_to, text) = self.pending_tokens.pop().unwrap();
+        self.current_token.offset_from = offset_from;
+        self.current_token.offset_to = offset_to;
+        self.current_token.position = self.position;
+        self.current_token.text.clear();
+        self.current_token.text.push_str(&text);
+        self.position += 1;
         true
     }
 
     fn token(&self) -> &tantivy::tokenizer::Token {
-        &self.token
+        &self.current_token
     }
 
     fn token_mut(&mut self) -> &mut tantivy::tokenizer::Token {
-        &mut self.token
+        &mut self.current_token
     }
 }
 
-/// Tokenize code into words, splitting on camelCase, snake_case, etc.
-fn tokenize_code(text: &str) -> Vec<(usize, usize, String)> {
+/// Split a word on camelCase boundaries.
+/// Returns Vec<(start_offset, end_offset, word)>
+fn split_camel_case(text: &str) -> Vec<(usize, usize, String)> {
     let mut tokens = Vec::new();
     let mut current_start = 0;
     let mut current_word = String::new();
     let mut prev_was_lower = false;
 
     for (i, c) in text.char_indices() {
-        let is_word_char = c.is_alphanumeric();
         let is_upper = c.is_uppercase();
         let is_lower = c.is_lowercase();
 
-        if !is_word_char {
-            // End of word
-            if !current_word.is_empty() {
-                tokens.push((current_start, i, current_word.to_lowercase()));
-                current_word.clear();
-            }
-            current_start = i + c.len_utf8();
-            prev_was_lower = false;
-            continue;
-        }
-
-        // Handle camelCase: split when going from lower to upper
+        // Split when going from lower to upper (camelCase boundary)
         if is_upper && prev_was_lower && !current_word.is_empty() {
-            tokens.push((current_start, i, current_word.to_lowercase()));
+            tokens.push((current_start, i, current_word.clone()));
             current_word.clear();
             current_start = i;
         }
@@ -240,14 +284,10 @@ fn tokenize_code(text: &str) -> Vec<(usize, usize, String)> {
 
     // Don't forget the last word
     if !current_word.is_empty() {
-        tokens.push((current_start, text.len(), current_word.to_lowercase()));
+        tokens.push((current_start, text.len(), current_word));
     }
 
-    // Filter out very short tokens (single chars that aren't meaningful)
     tokens
-        .into_iter()
-        .filter(|(_, _, t)| t.len() > 1 || t.chars().all(|c| c.is_numeric()))
-        .collect()
 }
 
 #[cfg(test)]
@@ -255,24 +295,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_tokenize_camel_case() {
-        let tokens = tokenize_code("camelCaseExample");
-        let words: Vec<_> = tokens.iter().map(|(_, _, t)| t.as_str()).collect();
-        assert_eq!(words, vec!["camel", "case", "example"]);
+    fn test_split_camel_case() {
+        let splits = split_camel_case("camelCaseExample");
+        let words: Vec<_> = splits.iter().map(|(_, _, t)| t.as_str()).collect();
+        assert_eq!(words, vec!["camel", "Case", "Example"]);
     }
 
     #[test]
-    fn test_tokenize_snake_case() {
-        let tokens = tokenize_code("snake_case_example");
-        let words: Vec<_> = tokens.iter().map(|(_, _, t)| t.as_str()).collect();
-        assert_eq!(words, vec!["snake", "case", "example"]);
-    }
-
-    #[test]
-    fn test_tokenize_mixed() {
-        let tokens = tokenize_code("getUserName_fromDB");
-        let words: Vec<_> = tokens.iter().map(|(_, _, t)| t.as_str()).collect();
-        assert_eq!(words, vec!["get", "user", "name", "from", "db"]);
+    fn test_split_snake_case() {
+        // snake_case is already split by SimpleTokenizer on '_'
+        let splits = split_camel_case("snake");
+        let words: Vec<_> = splits.iter().map(|(_, _, t)| t.as_str()).collect();
+        assert_eq!(words, vec!["snake"]);
     }
 
     #[test]
@@ -288,5 +322,37 @@ mod tests {
         let results = index.search("hello", 10).unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].doc_id, "test.rs");
+    }
+
+    #[test]
+    fn test_stemming() {
+        // Test that stemming works - "running" should match "run"
+        let index = Bm25Index::new_in_memory().unwrap();
+        index
+            .add_documents([
+                ("runner.rs", "fn running() {}"),
+                ("other.rs", "fn walking() {}"),
+            ])
+            .unwrap();
+
+        let results = index.search("run", 10).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].doc_id, "runner.rs");
+    }
+
+    #[test]
+    fn test_camel_case_search() {
+        let index = Bm25Index::new_in_memory().unwrap();
+        index
+            .add_documents([
+                ("user.rs", "fn getUserName() {}"),
+                ("other.rs", "fn getAddress() {}"),
+            ])
+            .unwrap();
+
+        // Should find getUserName when searching for "user"
+        let results = index.search("user", 10).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].doc_id, "user.rs");
     }
 }
