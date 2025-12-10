@@ -344,6 +344,12 @@ struct IndexableFile {
     content_bytes: Vec<u8>,
 }
 
+/// Format content with file path header for indexing.
+/// Both BM25 and embeddings benefit from the path context.
+fn format_for_indexing(path: &str, content: &str) -> String {
+    format!("// {path}\n{content}")
+}
+
 fn index(path: &std::path::Path) -> eyre::Result<()> {
     use indicatif::{ProgressBar, ProgressStyle};
 
@@ -436,13 +442,13 @@ fn index(path: &std::path::Path) -> eyre::Result<()> {
         .wrap_err_with(|| format!("failed to create embedding store at {embeddings_path:?}"))?;
 
     // Phase 4: Prepare file data and check embedding cache
-    struct FileToEmbed<'a> {
-        path: &'a str,
-        content: &'a str,
+    struct FileToEmbed {
+        path: String,
+        formatted_content: String,
         hash: sgrep_cas::ContentHash,
     }
 
-    let mut files_to_embed: Vec<FileToEmbed<'_>> = Vec::new();
+    let mut files_to_embed: Vec<FileToEmbed> = Vec::new();
     let mut cached_count = 0_u64;
 
     // Prepare documents for BM25 and check embedding cache
@@ -451,6 +457,7 @@ fn index(path: &std::path::Path) -> eyre::Result<()> {
         .map(|file| {
             let content_str =
                 std::str::from_utf8(&file.content_bytes).expect("already verified as UTF-8");
+            let formatted = format_for_indexing(&file.relative_path, content_str);
 
             // Check if embedding is cached
             let hash = sgrep_cas::ContentHash::from_content(&file.content_bytes);
@@ -458,13 +465,13 @@ fn index(path: &std::path::Path) -> eyre::Result<()> {
                 cached_count += 1;
             } else {
                 files_to_embed.push(FileToEmbed {
-                    path: &file.relative_path,
-                    content: content_str,
+                    path: file.relative_path.clone(),
+                    formatted_content: formatted.clone(),
                     hash,
                 });
             }
 
-            (file.relative_path.as_str(), content_str)
+            (file.relative_path.clone(), formatted)
         })
         .collect();
 
@@ -475,7 +482,7 @@ fn index(path: &std::path::Path) -> eyre::Result<()> {
     bm25_spinner.enable_steady_tick(std::time::Duration::from_millis(100));
 
     bm25_index
-        .add_documents(bm25_docs)
+        .add_documents(bm25_docs.iter().map(|(p, c)| (p.as_str(), c.as_str())))
         .wrap_err("failed to add documents to BM25 index")?;
 
     bm25_spinner.finish_with_message(format!("BM25 index: {} files", files.len()));
@@ -508,7 +515,7 @@ fn index(path: &std::path::Path) -> eyre::Result<()> {
 
             while batch_end < files_to_embed.len() {
                 let file = &files_to_embed[batch_end];
-                let est_tokens = file.content.len() / CHARS_PER_TOKEN;
+                let est_tokens = file.formatted_content.len() / CHARS_PER_TOKEN;
 
                 // Stop if adding this file would exceed limits (unless batch is empty)
                 if batch_end > batch_start
@@ -523,7 +530,7 @@ fn index(path: &std::path::Path) -> eyre::Result<()> {
             }
 
             let chunk = &files_to_embed[batch_start..batch_end];
-            let texts: Vec<&str> = chunk.iter().map(|f| f.content).collect();
+            let texts: Vec<&str> = chunk.iter().map(|f| f.formatted_content.as_str()).collect();
 
             // Show batch info
             if let Some(first) = chunk.first() {
@@ -544,7 +551,7 @@ fn index(path: &std::path::Path) -> eyre::Result<()> {
                     // Batch failed, try individually to isolate bad files
                     tracing::warn!(?e, "batch encoding failed, falling back to individual encoding");
                     for file in chunk {
-                        match encoder.encode_document(file.content) {
+                        match encoder.encode_document(&file.formatted_content) {
                             Ok(embedding) => {
                                 store.store_embeddings(&file.hash, embedding.view())?;
                                 embedded_count += 1;
