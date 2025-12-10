@@ -32,10 +32,10 @@ impl GpuDevice {
 
     /// Compute MaxSim scores for a query against multiple documents in a single GPU operation.
     ///
-    /// This is more efficient than sequential CPU MaxSim for batch re-ranking because:
-    /// 1. Single data transfer to GPU
-    /// 2. Parallel computation across all documents
-    /// 3. Unified memory on M-series means no copy overhead
+    /// This batches all documents into a single matrix multiplication for maximum GPU utilization:
+    /// 1. Concatenate all document tokens into one [M, D] matrix where M = sum of all doc tokens
+    /// 2. Single matmul: [Q, D] @ [D, M] = [Q, M]
+    /// 3. Split by document boundaries and compute max per document
     ///
     /// # Arguments
     /// * `query` - Query embedding [Q, D] where Q = num query tokens, D = embedding dim
@@ -55,7 +55,32 @@ impl GpuDevice {
         let num_query_tokens = query.nrows();
         let dim = query.ncols();
 
-        // Convert query to tensor [Q, D]
+        // Calculate total tokens and document boundaries
+        let mut total_tokens = 0_usize;
+        let mut doc_boundaries = Vec::with_capacity(documents.len() + 1);
+        doc_boundaries.push(0_usize);
+
+        for doc in documents {
+            if doc.ncols() != dim {
+                eyre::bail!(
+                    "dimension mismatch: query dim {dim}, doc dim {}",
+                    doc.ncols()
+                );
+            }
+            total_tokens += doc.nrows();
+            doc_boundaries.push(total_tokens);
+        }
+
+        // Concatenate all documents into a single [M, D] matrix
+        let mut all_docs = Vec::with_capacity(total_tokens * dim);
+        for doc in documents {
+            let slice = doc
+                .as_slice()
+                .ok_or_else(|| eyre::eyre!("doc not contiguous"))?;
+            all_docs.extend_from_slice(slice);
+        }
+
+        // Convert to tensors
         let query_slice = query
             .as_slice()
             .ok_or_else(|| eyre::eyre!("query not contiguous"))?;
@@ -63,45 +88,42 @@ impl GpuDevice {
             candle_core::Tensor::from_slice(query_slice, (num_query_tokens, dim), &self.device)
                 .wrap_err("failed to create query tensor")?;
 
+        let docs_tensor =
+            candle_core::Tensor::from_slice(&all_docs, (total_tokens, dim), &self.device)
+                .wrap_err("failed to create docs tensor")?;
+
+        // Single batched matmul: [Q, D] @ [D, M] = [Q, M]
+        let docs_t = docs_tensor.t().wrap_err("failed to transpose docs")?;
+        let similarities = query_tensor
+            .matmul(&docs_t)
+            .wrap_err("failed to compute similarities")?;
+
+        // Move to CPU for score extraction (small data, faster than GPU splits)
+        let similarities = similarities
+            .to_device(&candle_core::Device::Cpu)
+            .wrap_err("failed to move to CPU")?;
+        let sim_data = similarities
+            .to_vec2::<f32>()
+            .wrap_err("failed to extract similarities")?;
+
+        // Compute MaxSim for each document using boundaries
         let mut scores = Vec::with_capacity(documents.len());
+        for doc_idx in 0..documents.len() {
+            let start = doc_boundaries[doc_idx];
+            let end = doc_boundaries[doc_idx + 1];
 
-        // Process each document
-        // TODO: Could batch multiple small documents together for even better GPU utilization
-        for doc in documents {
-            let num_doc_tokens = doc.nrows();
-
-            if doc.ncols() != dim {
-                eyre::bail!(
-                    "dimension mismatch: query dim {dim}, doc dim {}",
-                    doc.ncols()
-                );
+            // For each query token, find max sim within this document's range
+            let mut total_score = 0.0_f32;
+            for query_row in &sim_data {
+                let max_sim = query_row[start..end]
+                    .iter()
+                    .copied()
+                    .fold(f32::NEG_INFINITY, f32::max);
+                if max_sim.is_finite() {
+                    total_score += max_sim;
+                }
             }
-
-            // Convert doc to tensor [T, D]
-            let doc_slice = doc
-                .as_slice()
-                .ok_or_else(|| eyre::eyre!("doc not contiguous"))?;
-            let doc_tensor =
-                candle_core::Tensor::from_slice(doc_slice, (num_doc_tokens, dim), &self.device)
-                    .wrap_err("failed to create doc tensor")?;
-
-            // Compute similarity matrix: [Q, D] @ [D, T] = [Q, T]
-            let doc_t = doc_tensor.t().wrap_err("failed to transpose doc")?;
-            let similarities = query_tensor
-                .matmul(&doc_t)
-                .wrap_err("failed to compute similarities")?;
-
-            // Max over document tokens (axis 1): [Q, T] -> [Q]
-            let max_sims = similarities.max(1).wrap_err("failed to compute max")?;
-
-            // Sum over query tokens: [Q] -> scalar
-            let score = max_sims
-                .sum_all()
-                .wrap_err("failed to sum")?
-                .to_scalar::<f32>()
-                .wrap_err("failed to extract scalar")?;
-
-            scores.push(score);
+            scores.push(total_score);
         }
 
         Ok(scores)
