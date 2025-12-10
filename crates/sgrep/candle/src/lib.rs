@@ -35,6 +35,10 @@ pub struct ColBertEncoder {
     model: model::JinaColBert,
     tokenizer: tokenizers::Tokenizer,
     device: candle_core::Device,
+    /// Reusable buffer for input IDs (avoids allocation per batch)
+    input_buffer: Vec<u32>,
+    /// Reusable buffer for attention mask
+    mask_buffer: Vec<u32>,
 }
 
 impl ColBertEncoder {
@@ -91,10 +95,15 @@ impl ColBertEncoder {
         let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
             .map_err(|e| eyre::eyre!("failed to load tokenizer from {}: {e}", tokenizer_path.display()))?;
 
+        // Pre-allocate buffers for max expected batch size (64 * 128 = 8192 tokens)
+        const MAX_BATCH_BUFFER: usize = 64 * MAX_SEQ_LENGTH;
+
         Ok(Self {
             model,
             tokenizer,
             device,
+            input_buffer: vec![0u32; MAX_BATCH_BUFFER],
+            mask_buffer: vec![0u32; MAX_BATCH_BUFFER],
         })
     }
 
@@ -220,6 +229,7 @@ impl ColBertEncoder {
         }
 
         let batch_size = texts.len();
+        let buffer_size = batch_size * MAX_SEQ_LENGTH;
 
         // Parallel tokenization using rayon
         let tokenized: Vec<_> = texts
@@ -231,9 +241,15 @@ impl ColBertEncoder {
             })
             .collect::<eyre::Result<Vec<_>>>()?;
 
-        // Pre-allocate contiguous buffers (zeros act as padding)
-        let mut all_input_ids = vec![0u32; batch_size * MAX_SEQ_LENGTH];
-        let mut all_attention_mask = vec![0u32; batch_size * MAX_SEQ_LENGTH];
+        // Reuse pre-allocated buffers, extending if needed
+        if self.input_buffer.len() < buffer_size {
+            self.input_buffer.resize(buffer_size, 0);
+            self.mask_buffer.resize(buffer_size, 0);
+        }
+
+        // Zero out the portion we'll use (faster than reallocating)
+        self.input_buffer[..buffer_size].fill(0);
+        self.mask_buffer[..buffer_size].fill(0);
         let mut token_counts = Vec::with_capacity(batch_size);
 
         // Fill buffers from tokenized results
@@ -247,31 +263,31 @@ impl ColBertEncoder {
 
             // CLS token
             if !ids.is_empty() {
-                all_input_ids[offset] = ids[0];
-                all_attention_mask[offset] = 1;
+                self.input_buffer[offset] = ids[0];
+                self.mask_buffer[offset] = 1;
             }
 
             // Marker token
-            all_input_ids[offset + 1] = marker_token_id;
-            all_attention_mask[offset + 1] = 1;
+            self.input_buffer[offset + 1] = marker_token_id;
+            self.mask_buffer[offset + 1] = 1;
 
             // Text tokens
             for (i, &id) in ids.iter().skip(1).take(MAX_SEQ_LENGTH - 2).enumerate() {
-                all_input_ids[offset + i + 2] = id;
-                all_attention_mask[offset + i + 2] = 1;
+                self.input_buffer[offset + i + 2] = id;
+                self.mask_buffer[offset + i + 2] = 1;
             }
         }
 
-        // Create batched tensors [batch_size, seq_len]
-        let input_ids = candle_core::Tensor::from_vec(
-            all_input_ids,
+        // Create batched tensors [batch_size, seq_len] from buffer slice
+        let input_ids = candle_core::Tensor::from_slice(
+            &self.input_buffer[..buffer_size],
             (batch_size, MAX_SEQ_LENGTH),
             &self.device,
         )
         .wrap_err("failed to create batched input_ids tensor")?;
 
-        let attention_mask = candle_core::Tensor::from_vec(
-            all_attention_mask,
+        let attention_mask = candle_core::Tensor::from_slice(
+            &self.mask_buffer[..buffer_size],
             (batch_size, MAX_SEQ_LENGTH),
             &self.device,
         )
