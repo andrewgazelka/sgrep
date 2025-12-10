@@ -79,21 +79,30 @@ impl Bm25Index {
         })
     }
 
-    /// Add a document to the index.
-    pub fn add_document(&self, path: &str, content: &str) -> eyre::Result<()> {
+    /// Add multiple documents to the index in a single batch.
+    /// This is much faster than calling `add_document` repeatedly.
+    pub fn add_documents<'a>(
+        &self,
+        documents: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> eyre::Result<()> {
+        use eyre::WrapErr as _;
+
         let mut writer = self
             .index
             .writer(50_000_000)
             .wrap_err("failed to create index writer")?;
 
-        let mut doc = tantivy::TantivyDocument::default();
-        doc.add_text(self.path_field, path);
-        doc.add_text(self.content_field, content);
+        for (path, content) in documents {
+            let mut doc = tantivy::TantivyDocument::default();
+            doc.add_text(self.path_field, path);
+            doc.add_text(self.content_field, content);
 
-        writer
-            .add_document(doc)
-            .wrap_err("failed to add document")?;
-        writer.commit().wrap_err("failed to commit")?;
+            writer
+                .add_document(doc)
+                .wrap_err_with(|| format!("failed to add document {path}"))?;
+        }
+
+        writer.commit().wrap_err("failed to commit index")?;
 
         Ok(())
     }
@@ -200,7 +209,6 @@ fn tokenize_code(text: &str) -> Vec<(usize, usize, String)> {
     let mut tokens = Vec::new();
     let mut current_start = 0;
     let mut current_word = String::new();
-    let mut _prev_was_upper = false;
     let mut prev_was_lower = false;
 
     for (i, c) in text.char_indices() {
@@ -215,7 +223,6 @@ fn tokenize_code(text: &str) -> Vec<(usize, usize, String)> {
                 current_word.clear();
             }
             current_start = i + c.len_utf8();
-            _prev_was_upper = false;
             prev_was_lower = false;
             continue;
         }
@@ -227,13 +234,7 @@ fn tokenize_code(text: &str) -> Vec<(usize, usize, String)> {
             current_start = i;
         }
 
-        // Handle XMLParser -> XML, Parser: split when going from multiple upper to lower
-        // e.g., "XMLParser" at 'a' we want to split "XM" from "LParser"... actually "XML" "Parser"
-        // This is tricky - we need lookahead or backtrack
-        // Simplified: just split on lower->upper for now
-
         current_word.push(c);
-        _prev_was_upper = is_upper;
         prev_was_lower = is_lower;
     }
 
@@ -278,10 +279,10 @@ mod tests {
     fn test_bm25_basic() {
         let index = Bm25Index::new_in_memory().unwrap();
         index
-            .add_document("test.rs", "fn hello_world() { println!(\"hello\"); }")
-            .unwrap();
-        index
-            .add_document("other.rs", "fn goodbye() { println!(\"bye\"); }")
+            .add_documents([
+                ("test.rs", "fn hello_world() { println!(\"hello\"); }"),
+                ("other.rs", "fn goodbye() { println!(\"bye\"); }"),
+            ])
             .unwrap();
 
         let results = index.search("hello", 10).unwrap();

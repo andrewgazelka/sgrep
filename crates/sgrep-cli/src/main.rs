@@ -435,16 +435,7 @@ fn index(path: &std::path::Path) -> eyre::Result<()> {
     let mut store = sgrep_cas::EmbeddingStore::open(embeddings_path.clone())
         .wrap_err_with(|| format!("failed to create embedding store at {embeddings_path:?}"))?;
 
-    // Phase 4: BM25 indexing (fast, sequential)
-    let bm25_progress = ProgressBar::new(files.len() as u64);
-    bm25_progress.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}) BM25: {msg}")
-            .wrap_err("invalid progress bar template")?
-            .progress_chars("█▓░"),
-    );
-
-    // Track which files need embedding
+    // Phase 4: Prepare file data and check embedding cache
     struct FileToEmbed<'a> {
         path: &'a str,
         content: &'a str,
@@ -454,31 +445,40 @@ fn index(path: &std::path::Path) -> eyre::Result<()> {
     let mut files_to_embed: Vec<FileToEmbed<'_>> = Vec::new();
     let mut cached_count = 0_u64;
 
-    for file in &files {
-        let content_str = std::str::from_utf8(&file.content_bytes)
-            .expect("already verified as UTF-8");
+    // Prepare documents for BM25 and check embedding cache
+    let bm25_docs: Vec<_> = files
+        .iter()
+        .map(|file| {
+            let content_str =
+                std::str::from_utf8(&file.content_bytes).expect("already verified as UTF-8");
 
-        // BM25 indexing
-        bm25_index
-            .add_document(&file.relative_path, content_str)
-            .wrap_err_with(|| format!("failed to add {} to BM25 index", file.relative_path))?;
+            // Check if embedding is cached
+            let hash = sgrep_cas::ContentHash::from_content(&file.content_bytes);
+            if store.has_embeddings(&hash) {
+                cached_count += 1;
+            } else {
+                files_to_embed.push(FileToEmbed {
+                    path: &file.relative_path,
+                    content: content_str,
+                    hash,
+                });
+            }
 
-        // Check if embedding is cached
-        let hash = sgrep_cas::ContentHash::from_content(&file.content_bytes);
-        if store.has_embeddings(&hash) {
-            cached_count += 1;
-        } else {
-            files_to_embed.push(FileToEmbed {
-                path: &file.relative_path,
-                content: content_str,
-                hash,
-            });
-        }
+            (file.relative_path.as_str(), content_str)
+        })
+        .collect();
 
-        bm25_progress.set_message(file.relative_path.clone());
-        bm25_progress.inc(1);
-    }
-    bm25_progress.finish_and_clear();
+    // BM25 indexing - single batch commit (much faster than per-document)
+    let bm25_spinner = ProgressBar::new_spinner();
+    bm25_spinner.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg}")?);
+    bm25_spinner.set_message(format!("Indexing {} files for BM25...", bm25_docs.len()));
+    bm25_spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+
+    bm25_index
+        .add_documents(bm25_docs)
+        .wrap_err("failed to add documents to BM25 index")?;
+
+    bm25_spinner.finish_with_message(format!("BM25 index: {} files", files.len()));
 
     // Phase 5: Batched GPU embedding
     let mut embedded_count = 0_u64;
