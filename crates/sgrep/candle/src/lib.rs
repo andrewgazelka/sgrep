@@ -219,12 +219,13 @@ impl ColBertEncoder {
 
         let batch_size = texts.len();
 
-        // Tokenize all texts and track their actual token counts
-        let mut all_input_ids = Vec::with_capacity(batch_size * MAX_SEQ_LENGTH);
-        let mut all_attention_mask = Vec::with_capacity(batch_size * MAX_SEQ_LENGTH);
+        // Pre-allocate contiguous buffers (zeros act as padding)
+        let mut all_input_ids = vec![0u32; batch_size * MAX_SEQ_LENGTH];
+        let mut all_attention_mask = vec![0u32; batch_size * MAX_SEQ_LENGTH];
         let mut token_counts = Vec::with_capacity(batch_size);
 
-        for text in texts {
+        // Tokenize each text (sequential but writes directly to pre-allocated buffer)
+        for (idx, text) in texts.iter().enumerate() {
             let encoding = self
                 .tokenizer
                 .encode(*text, true)
@@ -235,27 +236,23 @@ impl ColBertEncoder {
             let total_token_count = text_token_count + 2; // +2 for CLS and marker
             token_counts.push(total_token_count);
 
-            let mut input_ids = vec![0u32; MAX_SEQ_LENGTH];
-            let mut attention_mask = vec![0u32; MAX_SEQ_LENGTH];
+            let offset = idx * MAX_SEQ_LENGTH;
 
             // CLS token
             if !ids.is_empty() {
-                input_ids[0] = ids[0];
-                attention_mask[0] = 1;
+                all_input_ids[offset] = ids[0];
+                all_attention_mask[offset] = 1;
             }
 
             // Marker token
-            input_ids[1] = marker_token_id;
-            attention_mask[1] = 1;
+            all_input_ids[offset + 1] = marker_token_id;
+            all_attention_mask[offset + 1] = 1;
 
             // Text tokens
             for (i, &id) in ids.iter().skip(1).take(MAX_SEQ_LENGTH - 2).enumerate() {
-                input_ids[i + 2] = id;
-                attention_mask[i + 2] = 1;
+                all_input_ids[offset + i + 2] = id;
+                all_attention_mask[offset + i + 2] = 1;
             }
-
-            all_input_ids.extend(input_ids);
-            all_attention_mask.extend(attention_mask);
         }
 
         // Create batched tensors [batch_size, seq_len]
