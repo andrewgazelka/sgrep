@@ -640,6 +640,9 @@ fn index(path: &std::path::Path) -> eyre::Result<()> {
             batch_start = batch_end;
         }
         embed_progress.finish_and_clear();
+
+        // Flush embeddings to disk
+        store.flush().wrap_err("failed to flush embeddings")?;
     }
 
     let elapsed = start_time.elapsed();

@@ -9,7 +9,7 @@
 //! - Single mmap for all reads
 //! - Fast batch lookups for GPU operations
 
-use std::io::{Read as _, Seek as _, Write as _};
+use std::io::{Read as _, Seek, Write as _};
 
 use eyre::WrapErr as _;
 
@@ -99,6 +99,10 @@ pub struct EmbeddingStore {
     mmap: Option<memmap2::Mmap>,
     /// In-memory index: hash -> (offset, num_tokens)
     index: std::collections::HashMap<ContentHash, (u64, u32)>,
+    /// Buffered file handle for batch writes (avoids repeated open/close)
+    write_handle: Option<std::io::BufWriter<std::fs::File>>,
+    /// Track if we have unflushed writes
+    dirty: bool,
 }
 
 impl EmbeddingStore {
@@ -111,6 +115,8 @@ impl EmbeddingStore {
             base_path,
             mmap: None,
             index: std::collections::HashMap::new(),
+            write_handle: None,
+            dirty: false,
         };
 
         // Load existing index if present
@@ -228,7 +234,23 @@ impl EmbeddingStore {
         self.index.contains_key(hash)
     }
 
+    /// Get or create the buffered write handle.
+    fn get_write_handle(&mut self) -> eyre::Result<&mut std::io::BufWriter<std::fs::File>> {
+        if self.write_handle.is_none() {
+            let data_path = self.base_path.join(DATA_FILE);
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&data_path)
+                .wrap_err_with(|| format!("failed to open data file {}", data_path.display()))?;
+            self.write_handle = Some(std::io::BufWriter::with_capacity(64 * 1024, file));
+        }
+        Ok(self.write_handle.as_mut().expect("just initialized"))
+    }
+
     /// Store embeddings for a content hash.
+    ///
+    /// Writes are buffered. Call `flush()` to persist to disk.
     pub fn store_embeddings(
         &mut self,
         hash: &ContentHash,
@@ -250,44 +272,59 @@ impl EmbeddingStore {
             );
         }
 
-        let data_path = self.base_path.join(DATA_FILE);
+        let writer = self.get_write_handle()?;
 
-        // Open file for appending
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&data_path)
-            .wrap_err_with(|| format!("failed to open data file {}", data_path.display()))?;
-
-        // Get current offset (file size)
-        let offset = file
-            .seek(std::io::SeekFrom::End(0))
-            .wrap_err("failed to seek to end")?;
+        // Get current offset (file position)
+        let offset = writer
+            .stream_position()
+            .wrap_err("failed to get stream position")?;
 
         // Write embedding data
         if embedding.is_standard_layout() {
             let slice = embedding.as_slice().expect("standard layout but no slice");
             let bytes =
                 unsafe { std::slice::from_raw_parts(slice.as_ptr().cast::<u8>(), slice.len() * 4) };
-            file.write_all(bytes)
+            writer
+                .write_all(bytes)
                 .wrap_err("failed to write embeddings")?;
         } else {
             for &val in embedding.iter() {
-                file.write_all(&val.to_le_bytes())
+                writer
+                    .write_all(&val.to_le_bytes())
                     .wrap_err("failed to write embedding value")?;
             }
         }
 
-        // Update index
+        // Update in-memory index
         let num_tokens_u32 = u32::try_from(num_tokens).wrap_err("too many tokens")?;
         self.index.insert(*hash, (offset, num_tokens_u32));
 
-        // Invalidate mmap (will be recreated on next read)
+        // Mark dirty - index needs to be written on flush
+        self.dirty = true;
+
+        // Invalidate mmap (will be recreated on next read after flush)
         self.mmap = None;
+
+        Ok(())
+    }
+
+    /// Flush buffered writes to disk and update the index file.
+    ///
+    /// Call this after a batch of `store_embeddings` calls.
+    pub fn flush(&mut self) -> eyre::Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+
+        // Flush buffered data
+        if let Some(writer) = &mut self.write_handle {
+            writer.flush().wrap_err("failed to flush embeddings")?;
+        }
 
         // Write updated index
         self.write_index()?;
 
+        self.dirty = false;
         Ok(())
     }
 
@@ -395,6 +432,15 @@ impl EmbeddingStore {
     }
 }
 
+impl Drop for EmbeddingStore {
+    fn drop(&mut self) {
+        // Best-effort flush on drop
+        if self.dirty {
+            let _ = self.flush();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,8 +467,9 @@ mod tests {
             (i * sgrep_core::EMBEDDING_DIM + j) as f32
         });
 
-        // Store
+        // Store and flush
         store.store_embeddings(&hash, embedding.view()).unwrap();
+        store.flush().unwrap();
         assert!(store.has_embeddings(&hash));
 
         // Reload store
@@ -461,6 +508,7 @@ mod tests {
                 });
             store.store_embeddings(&hash, embedding.view()).unwrap();
         }
+        store.flush().unwrap();
 
         assert_eq!(store.len(), 5);
 
