@@ -31,8 +31,8 @@ fn main() -> eyre::Result<()> {
         } => {
             search(&query, &path, limit, bm25_only, json)?;
         }
-        Command::Index { path, verbose } => {
-            index(&path, verbose)?;
+        Command::Index { path } => {
+            index(&path)?;
         }
     }
 
@@ -77,10 +77,6 @@ enum Command {
     Index {
         /// Path to index
         path: std::path::PathBuf,
-
-        /// Show verbose output (files being indexed)
-        #[arg(short, long)]
-        verbose: bool,
     },
 }
 
@@ -332,7 +328,7 @@ struct IndexableFile {
     content_bytes: Vec<u8>,
 }
 
-fn index(path: &std::path::Path, verbose: bool) -> eyre::Result<()> {
+fn index(path: &std::path::Path) -> eyre::Result<()> {
     use indicatif::{ProgressBar, ProgressStyle};
 
     let index_path = path.join(INDEX_DIR);
@@ -473,9 +469,7 @@ fn index(path: &std::path::Path, verbose: bool) -> eyre::Result<()> {
             cached_count += 1;
         }
 
-        if verbose {
-            progress.println(format!("  {}", file.relative_path));
-        }
+        progress.set_message(file.relative_path.clone());
         progress.inc(1);
     }
 
