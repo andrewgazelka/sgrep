@@ -355,4 +355,84 @@ mod tests {
         assert!(!results.is_empty());
         assert_eq!(results[0].doc_id, "user.rs");
     }
+
+    /// Helper to get tokens from the code tokenizer pipeline.
+    fn tokenize(text: &str) -> Vec<String> {
+        use tantivy::tokenizer::TokenStream as _;
+
+        let mut tokenizer = build_code_tokenizer();
+        let mut stream = tokenizer.token_stream(text);
+        let mut tokens = Vec::new();
+        while stream.advance() {
+            tokens.push(stream.token().text.clone());
+        }
+        tokens
+    }
+
+    #[test]
+    fn test_query_and_doc_tokenize_same() {
+        // Verify query and document produce identical tokens
+        // This is critical for BM25 matching to work correctly
+
+        // camelCase
+        assert_eq!(tokenize("getUserName"), tokenize("getUserName"));
+
+        // snake_case
+        assert_eq!(tokenize("get_user_name"), tokenize("get_user_name"));
+
+        // Stemming should produce same stems
+        assert_eq!(tokenize("running"), tokenize("runs"));
+        assert_eq!(tokenize("user"), tokenize("users"));
+    }
+
+    #[test]
+    fn test_tokenizer_pipeline_output() {
+        // Verify the full pipeline produces expected tokens
+
+        // camelCase -> split -> lowercase -> stem
+        let tokens = tokenize("getUserName");
+        assert_eq!(tokens, vec!["get", "user", "name"]);
+
+        // snake_case -> split on _ -> lowercase -> stem
+        let tokens = tokenize("get_user_name");
+        assert_eq!(tokens, vec!["get", "user", "name"]);
+
+        // Stemming
+        let tokens = tokenize("running");
+        assert_eq!(tokens, vec!["run"]);
+
+        // Mixed
+        let tokens = tokenize("parseUserData");
+        assert_eq!(tokens, vec!["pars", "user", "data"]); // "parse" stems to "pars"
+    }
+
+    #[test]
+    fn test_bidirectional_stemming_search() {
+        // Query "users" should find doc with "user" and vice versa
+        let index = Bm25Index::new_in_memory().unwrap();
+        index
+            .add_documents([
+                ("a.rs", "fn getUser() {}"),
+                ("b.rs", "fn getAddress() {}"),
+            ])
+            .unwrap();
+
+        // "users" (plural) should match "User" (singular, camelCase)
+        let results = index.search("users", 10).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].doc_id, "a.rs");
+
+        // "running" should match "run"
+        let index2 = Bm25Index::new_in_memory().unwrap();
+        index2
+            .add_documents([
+                ("runner.rs", "fn run() {}"),
+                ("other.rs", "fn walk() {}"),
+            ])
+            .unwrap();
+
+        let results = index2.search("running", 10).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].doc_id, "runner.rs");
+    }
 }
