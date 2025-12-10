@@ -326,24 +326,27 @@ fn search(
     Ok(())
 }
 
+/// File to be indexed with its content pre-loaded.
+struct IndexableFile {
+    relative_path: String,
+    content_bytes: Vec<u8>,
+}
+
 fn index(path: &std::path::Path, verbose: bool) -> eyre::Result<()> {
+    use indicatif::{ProgressBar, ProgressStyle};
+
     let index_path = path.join(INDEX_DIR);
-    eprintln!("Indexing {} -> {}", path.display(), index_path.display());
 
-    // Create BM25 index
-    let bm25_path = index_path.join(BM25_DIR);
-    let bm25_index = sgrep_index::Bm25Index::new_at_path(&bm25_path)
-        .wrap_err_with(|| format!("failed to create BM25 index at {bm25_path:?}"))?;
+    // Phase 1: Discover files
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.cyan} {msg}")
+            .wrap_err("invalid spinner template")?,
+    );
+    spinner.set_message("Discovering files...");
+    spinner.enable_steady_tick(std::time::Duration::from_millis(80));
 
-    // Create embedding store
-    let embeddings_path = index_path.join(EMBEDDINGS_DIR);
-    let mut store = sgrep_cas::EmbeddingStore::open(embeddings_path.clone())
-        .wrap_err_with(|| format!("failed to create embedding store at {embeddings_path:?}"))?;
-
-    // Load ColBERT encoder
-    let mut encoder = load_encoder()?;
-
-    // Collect files to index
     let walker = ignore::WalkBuilder::new(path)
         .hidden(false)
         .git_ignore(true)
@@ -351,8 +354,10 @@ fn index(path: &std::path::Path, verbose: bool) -> eyre::Result<()> {
         .git_exclude(true)
         .build();
 
-    let mut count = 0;
-    let mut embedded_count = 0;
+    const MAX_FILE_SIZE: u64 = 1024 * 1024; // 1MB
+    let mut files: Vec<IndexableFile> = Vec::new();
+    let mut skipped_large = 0_u64;
+    let mut skipped_binary = 0_u64;
 
     for entry in walker {
         let entry = entry.wrap_err("failed to read directory entry")?;
@@ -362,17 +367,15 @@ fn index(path: &std::path::Path, verbose: bool) -> eyre::Result<()> {
             continue;
         }
 
-        // Skip binary files and large files
         let metadata = std::fs::metadata(file_path)
             .wrap_err_with(|| format!("failed to read metadata for {file_path:?}"))?;
 
-        const MAX_FILE_SIZE: u64 = 1024 * 1024; // 1MB
         if metadata.len() > MAX_FILE_SIZE {
+            skipped_large += 1;
             tracing::debug!(?file_path, "skipping large file");
             continue;
         }
 
-        // Read file content
         let content_bytes = match std::fs::read(file_path) {
             Ok(c) => c,
             Err(_) => {
@@ -381,54 +384,125 @@ fn index(path: &std::path::Path, verbose: bool) -> eyre::Result<()> {
             }
         };
 
-        // Try to read as UTF-8 for BM25
-        let content_str = match std::str::from_utf8(&content_bytes) {
-            Ok(s) => s,
-            Err(_) => {
-                tracing::debug!(?file_path, "skipping non-utf8 file");
-                continue;
-            }
-        };
+        // Skip non-UTF8 files
+        if std::str::from_utf8(&content_bytes).is_err() {
+            skipped_binary += 1;
+            tracing::debug!(?file_path, "skipping non-utf8 file");
+            continue;
+        }
 
         let relative_path = file_path
             .strip_prefix(path)
             .unwrap_or(file_path)
-            .to_string_lossy();
+            .to_string_lossy()
+            .to_string();
+
+        spinner.set_message(format!("Discovering files... {}", files.len()));
+        files.push(IndexableFile {
+            relative_path,
+            content_bytes,
+        });
+    }
+
+    spinner.finish_with_message(format!(
+        "Found {} files (skipped: {} large, {} binary)",
+        files.len(),
+        skipped_large,
+        skipped_binary
+    ));
+
+    if files.is_empty() {
+        println!("No files to index");
+        return Ok(());
+    }
+
+    // Phase 2: Load encoder
+    let mut encoder = load_encoder()?;
+
+    // Phase 3: Create indices
+    let bm25_path = index_path.join(BM25_DIR);
+    let bm25_index = sgrep_index::Bm25Index::new_at_path(&bm25_path)
+        .wrap_err_with(|| format!("failed to create BM25 index at {bm25_path:?}"))?;
+
+    let embeddings_path = index_path.join(EMBEDDINGS_DIR);
+    let mut store = sgrep_cas::EmbeddingStore::open(embeddings_path.clone())
+        .wrap_err_with(|| format!("failed to create embedding store at {embeddings_path:?}"))?;
+
+    // Phase 4: Index with progress bar
+    let progress = ProgressBar::new(files.len() as u64);
+    progress.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}) {msg}")
+            .wrap_err("invalid progress bar template")?
+            .progress_chars("█▓░"),
+    );
+
+    let mut embedded_count = 0_u64;
+    let mut cached_count = 0_u64;
+    let mut encode_errors = 0_u64;
+    let start_time = std::time::Instant::now();
+
+    for file in &files {
+        // Safe: we verified UTF-8 above
+        let content_str = std::str::from_utf8(&file.content_bytes)
+            .expect("already verified as UTF-8");
 
         // Index in BM25
         bm25_index
-            .add_document(&relative_path, content_str)
-            .wrap_err_with(|| format!("failed to add {relative_path} to BM25 index"))?;
+            .add_document(&file.relative_path, content_str)
+            .wrap_err_with(|| format!("failed to add {} to BM25 index", file.relative_path))?;
 
         // Compute and store embeddings (skip if already cached)
-        let hash = sgrep_cas::ContentHash::from_content(&content_bytes);
+        let hash = sgrep_cas::ContentHash::from_content(&file.content_bytes);
         if !store.has_embeddings(&hash) {
             match encoder.encode_document(content_str) {
                 Ok(embedding) => {
                     store
                         .store_embeddings(&hash, embedding.view())
                         .wrap_err_with(|| {
-                            format!("failed to store embeddings for {relative_path}")
+                            format!("failed to store embeddings for {}", file.relative_path)
                         })?;
                     embedded_count += 1;
                 }
                 Err(e) => {
-                    tracing::warn!(?file_path, ?e, "failed to encode document");
+                    encode_errors += 1;
+                    tracing::warn!(path = %file.relative_path, ?e, "failed to encode document");
                 }
             }
         } else {
-            embedded_count += 1;
+            cached_count += 1;
         }
 
-        count += 1;
         if verbose {
-            eprintln!("  {relative_path}");
-        } else if count % 100 == 0 {
-            eprintln!("Indexed {count} files...");
+            progress.println(format!("  {}", file.relative_path));
         }
+        progress.inc(1);
     }
 
-    println!("Indexed {count} files ({embedded_count} with embeddings)");
+    let elapsed = start_time.elapsed();
+    progress.finish_and_clear();
+
+    // Final summary
+    let total = files.len() as u64;
+    let files_per_sec = if elapsed.as_secs_f64() > 0.0 {
+        total as f64 / elapsed.as_secs_f64()
+    } else {
+        0.0
+    };
+
+    println!(
+        "Indexed {} files in {:.1}s ({:.1} files/sec)",
+        total,
+        elapsed.as_secs_f64(),
+        files_per_sec
+    );
+    println!(
+        "  Embeddings: {} new, {} cached",
+        embedded_count, cached_count
+    );
+    if encode_errors > 0 {
+        println!("  Encode errors: {encode_errors}");
+    }
 
     Ok(())
 }

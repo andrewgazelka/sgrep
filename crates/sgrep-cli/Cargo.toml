@@ -24,6 +24,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
 ignore.workspace = true
+indicatif.workspace = true
 hf-hub.workspace = true
 
 [lints]
