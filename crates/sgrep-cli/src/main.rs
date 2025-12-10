@@ -103,6 +103,27 @@ fn load_encoder() -> eyre::Result<sgrep_candle::ColBertEncoder> {
         .wrap_err("failed to load ColBERT encoder")
 }
 
+/// Create a file walker that respects gitignore and always ignores .sgrep.
+fn create_walker(path: &std::path::Path) -> eyre::Result<ignore::Walk> {
+    use eyre::WrapErr as _;
+
+    let mut builder = ignore::WalkBuilder::new(path);
+    builder
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true);
+
+    // Always ignore .sgrep directory
+    let mut overrides = ignore::overrides::OverrideBuilder::new(path);
+    overrides
+        .add("!.sgrep/")
+        .wrap_err("failed to add .sgrep override")?;
+    builder.overrides(overrides.build().wrap_err("failed to build overrides")?);
+
+    Ok(builder.build())
+}
+
 /// Build a mapping from doc_id to content hash for semantic search.
 fn build_doc_hash_map(
     store: &sgrep_cas::EmbeddingStore,
@@ -110,12 +131,7 @@ fn build_doc_hash_map(
 ) -> eyre::Result<std::collections::HashMap<String, sgrep_cas::ContentHash>> {
     let mut map = std::collections::HashMap::new();
 
-    let walker = ignore::WalkBuilder::new(path)
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .build();
+    let walker = create_walker(path)?;
 
     for entry in walker {
         let entry = entry.wrap_err("failed to read directory entry")?;
@@ -343,12 +359,7 @@ fn index(path: &std::path::Path) -> eyre::Result<()> {
     spinner.set_message("Discovering files...");
     spinner.enable_steady_tick(std::time::Duration::from_millis(80));
 
-    let walker = ignore::WalkBuilder::new(path)
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .build();
+    let walker = create_walker(path)?;
 
     const MAX_FILE_SIZE: u64 = 1024 * 1024; // 1MB
     let mut files: Vec<IndexableFile> = Vec::new();
