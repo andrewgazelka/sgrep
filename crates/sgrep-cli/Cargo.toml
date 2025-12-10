@@ -26,6 +26,7 @@ clap.workspace = true
 ignore.workspace = true
 indicatif.workspace = true
 hf-hub.workspace = true
+rayon.workspace = true
 
 [lints]
 workspace = true

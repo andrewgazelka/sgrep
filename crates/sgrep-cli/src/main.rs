@@ -103,7 +103,7 @@ fn load_encoder() -> eyre::Result<sgrep_candle::ColBertEncoder> {
         .wrap_err("failed to load ColBERT encoder")
 }
 
-/// Create a file walker that respects gitignore and always ignores .sgrep.
+/// Create a file walker that respects gitignore and ignores internal directories.
 fn create_walker(path: &std::path::Path) -> eyre::Result<ignore::Walk> {
     use eyre::WrapErr as _;
 
@@ -114,11 +114,14 @@ fn create_walker(path: &std::path::Path) -> eyre::Result<ignore::Walk> {
         .git_global(true)
         .git_exclude(true);
 
-    // Always ignore .sgrep directory
+    // Always ignore .sgrep and .git directories
     let mut overrides = ignore::overrides::OverrideBuilder::new(path);
     overrides
         .add("!.sgrep/")
         .wrap_err("failed to add .sgrep override")?;
+    overrides
+        .add("!.git/")
+        .wrap_err("failed to add .git override")?;
     builder.overrides(overrides.build().wrap_err("failed to build overrides")?);
 
     Ok(builder.build())

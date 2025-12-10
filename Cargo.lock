@@ -3233,6 +3233,7 @@ dependencies = [
  "hf-hub",
  "ignore",
  "indicatif 0.18.3",
+ "rayon",
  "serde",
  "serde_json",
  "sgrep-candle",
