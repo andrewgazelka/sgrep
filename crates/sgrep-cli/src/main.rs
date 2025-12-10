@@ -355,10 +355,11 @@ fn format_for_indexing(path: &str, content: &str) -> String {
 
 fn index(path: &std::path::Path) -> eyre::Result<()> {
     use indicatif::{ProgressBar, ProgressStyle};
+    use rayon::prelude::*;
 
     let index_path = path.join(INDEX_DIR);
 
-    // Phase 1: Discover files
+    // Phase 1: Discover files (parallel I/O)
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
         ProgressStyle::default_spinner()
@@ -368,56 +369,67 @@ fn index(path: &std::path::Path) -> eyre::Result<()> {
     spinner.set_message("Discovering files...");
     spinner.enable_steady_tick(std::time::Duration::from_millis(80));
 
-    let walker = create_walker(path)?;
-
     const MAX_FILE_SIZE: u64 = 1024 * 1024; // 1MB
-    let mut files: Vec<IndexableFile> = Vec::new();
+
+    // Collect paths first (fast, sequential)
+    let walker = create_walker(path)?;
+    let entries: Vec<_> = walker
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .collect();
+
+    spinner.set_message(format!("Reading {} files...", entries.len()));
+
+    // Read files in parallel
+    enum FileResult {
+        Ok(IndexableFile),
+        SkippedLarge,
+        SkippedBinary,
+    }
+
+    let results: Vec<_> = entries
+        .par_iter()
+        .filter_map(|entry| {
+            let file_path = entry.path();
+
+            let metadata = std::fs::metadata(file_path).ok()?;
+            if metadata.len() > MAX_FILE_SIZE {
+                tracing::debug!(?file_path, "skipping large file");
+                return Some(FileResult::SkippedLarge);
+            }
+
+            let content_bytes = std::fs::read(file_path).ok()?;
+
+            // Skip non-UTF8 files
+            if std::str::from_utf8(&content_bytes).is_err() {
+                tracing::debug!(?file_path, "skipping non-utf8 file");
+                return Some(FileResult::SkippedBinary);
+            }
+
+            let relative_path = file_path
+                .strip_prefix(path)
+                .unwrap_or(file_path)
+                .to_string_lossy()
+                .to_string();
+
+            Some(FileResult::Ok(IndexableFile {
+                relative_path,
+                content_bytes,
+            }))
+        })
+        .collect();
+
+    // Partition results
+    let mut files = Vec::new();
     let mut skipped_large = 0_u64;
     let mut skipped_binary = 0_u64;
 
-    for entry in walker {
-        let entry = entry.wrap_err("failed to read directory entry")?;
-        let file_path = entry.path();
-
-        if !file_path.is_file() {
-            continue;
+    for result in results {
+        match result {
+            FileResult::Ok(file) => files.push(file),
+            FileResult::SkippedLarge => skipped_large += 1,
+            FileResult::SkippedBinary => skipped_binary += 1,
         }
-
-        let metadata = std::fs::metadata(file_path)
-            .wrap_err_with(|| format!("failed to read metadata for {file_path:?}"))?;
-
-        if metadata.len() > MAX_FILE_SIZE {
-            skipped_large += 1;
-            tracing::debug!(?file_path, "skipping large file");
-            continue;
-        }
-
-        let content_bytes = match std::fs::read(file_path) {
-            Ok(c) => c,
-            Err(_) => {
-                tracing::debug!(?file_path, "skipping unreadable file");
-                continue;
-            }
-        };
-
-        // Skip non-UTF8 files
-        if std::str::from_utf8(&content_bytes).is_err() {
-            skipped_binary += 1;
-            tracing::debug!(?file_path, "skipping non-utf8 file");
-            continue;
-        }
-
-        let relative_path = file_path
-            .strip_prefix(path)
-            .unwrap_or(file_path)
-            .to_string_lossy()
-            .to_string();
-
-        spinner.set_message(format!("Discovering files... {}", files.len()));
-        files.push(IndexableFile {
-            relative_path,
-            content_bytes,
-        });
     }
 
     spinner.finish_with_message(format!(
@@ -497,9 +509,8 @@ fn index(path: &std::path::Path) -> eyre::Result<()> {
 
     if !files_to_embed.is_empty() {
         // Dynamic batching: pack files by estimated token count
-        // Max 32 files or ~4096 total tokens per batch (whichever comes first)
-        const MAX_BATCH_FILES: usize = 32;
-        const MAX_BATCH_TOKENS: usize = 4096;
+        const MAX_BATCH_FILES: usize = 64;
+        const MAX_BATCH_TOKENS: usize = 8192;
         const CHARS_PER_TOKEN: usize = 4; // rough estimate
 
         let embed_progress = ProgressBar::new(files_to_embed.len() as u64);
