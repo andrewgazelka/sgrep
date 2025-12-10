@@ -1,4 +1,7 @@
 //! Rank fusion combining BM25 and embedding scores.
+//!
+//! Provides multiple fusion strategies for combining lexical (BM25) and
+//! semantic (ColBERT) search results.
 
 use std::collections::HashMap;
 
@@ -38,48 +41,40 @@ pub fn reciprocal_rank_fusion(
     fused
 }
 
-/// Linear combination of normalized scores.
+/// Weighted score fusion with min-max normalization.
 ///
-/// Normalizes each ranking's scores to [0, 1] then combines with weights.
-pub fn linear_combination(
-    rankings: &[Vec<sgrep_core::SearchResult>],
-    weights: &[f32],
+/// Normalizes each source's scores to [0, 1] using min-max scaling,
+/// then combines with specified weights.
+///
+/// # Arguments
+/// * `bm25_results` - BM25 search results
+/// * `semantic_results` - Semantic (ColBERT) search results
+/// * `bm25_weight` - Weight for BM25 scores (0.0 to 1.0)
+///
+/// Semantic weight is automatically `1.0 - bm25_weight`.
+pub fn weighted_fusion(
+    bm25_results: &[sgrep_core::SearchResult],
+    semantic_results: &[sgrep_core::SearchResult],
+    bm25_weight: f32,
 ) -> Vec<sgrep_core::SearchResult> {
-    if rankings.len() != weights.len() {
-        return Vec::new();
+    let semantic_weight = 1.0 - bm25_weight;
+
+    // Build normalized score maps
+    let bm25_normalized = normalize_scores(bm25_results);
+    let semantic_normalized = normalize_scores(semantic_results);
+
+    // Combine scores
+    let mut combined: HashMap<String, f32> = HashMap::new();
+
+    for (doc_id, score) in &bm25_normalized {
+        *combined.entry(doc_id.clone()).or_insert(0.0) += score * bm25_weight;
     }
 
-    let mut scores: HashMap<String, f32> = HashMap::new();
-
-    for (ranking, &weight) in rankings.iter().zip(weights.iter()) {
-        if ranking.is_empty() {
-            continue;
-        }
-
-        // Find min and max scores for normalization
-        let max_score = ranking
-            .iter()
-            .map(|r| r.score)
-            .fold(f32::NEG_INFINITY, f32::max);
-        let min_score = ranking
-            .iter()
-            .map(|r| r.score)
-            .fold(f32::INFINITY, f32::min);
-
-        let range = max_score - min_score;
-
-        for result in ranking {
-            let normalized = if range > 0.0 {
-                (result.score - min_score) / range
-            } else {
-                1.0 // All scores are the same
-            };
-
-            *scores.entry(result.doc_id.clone()).or_insert(0.0) += normalized * weight;
-        }
+    for (doc_id, score) in &semantic_normalized {
+        *combined.entry(doc_id.clone()).or_insert(0.0) += score * semantic_weight;
     }
 
-    let mut fused: Vec<_> = scores
+    let mut fused: Vec<_> = combined
         .into_iter()
         .map(|(doc_id, score)| sgrep_core::SearchResult { doc_id, score })
         .collect();
@@ -91,6 +86,75 @@ pub fn linear_combination(
     });
 
     fused
+}
+
+/// Normalize scores to [0, 1] using min-max scaling.
+fn normalize_scores(results: &[sgrep_core::SearchResult]) -> HashMap<String, f32> {
+    if results.is_empty() {
+        return HashMap::new();
+    }
+
+    let max_score = results
+        .iter()
+        .map(|r| r.score)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let min_score = results
+        .iter()
+        .map(|r| r.score)
+        .fold(f32::INFINITY, f32::min);
+
+    let range = max_score - min_score;
+
+    results
+        .iter()
+        .map(|r| {
+            let normalized = if range > f32::EPSILON {
+                (r.score - min_score) / range
+            } else {
+                1.0 // All scores equal
+            };
+            (r.doc_id.clone(), normalized)
+        })
+        .collect()
+}
+
+/// Aggregate chunk scores to file scores.
+///
+/// When searching returns chunks, this aggregates them back to file-level scores.
+/// Uses max score per file (best matching chunk wins).
+pub fn aggregate_chunks_to_files(
+    chunk_results: &[sgrep_core::SearchResult],
+) -> Vec<sgrep_core::SearchResult> {
+    let mut file_scores: HashMap<String, f32> = HashMap::new();
+
+    for result in chunk_results {
+        // Parse chunk ID to get file path
+        let file_path = if let Some((path, _)) = sgrep_chunk::parse_chunk_id(&result.doc_id) {
+            path.to_string()
+        } else {
+            // Not a chunk ID, use as-is
+            result.doc_id.clone()
+        };
+
+        // Use max score for each file
+        let entry = file_scores.entry(file_path).or_insert(f32::NEG_INFINITY);
+        if result.score > *entry {
+            *entry = result.score;
+        }
+    }
+
+    let mut files: Vec<_> = file_scores
+        .into_iter()
+        .map(|(doc_id, score)| sgrep_core::SearchResult { doc_id, score })
+        .collect();
+
+    files.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    files
 }
 
 #[cfg(test)]
@@ -126,20 +190,49 @@ mod tests {
     }
 
     #[test]
-    fn test_linear_combination() {
-        let ranking1 = make_results(&[("a", 1.0), ("b", 0.5)]);
-        let ranking2 = make_results(&[("b", 1.0), ("a", 0.0)]);
+    fn test_weighted_fusion() {
+        let bm25 = make_results(&[("a", 10.0), ("b", 5.0)]);
+        let semantic = make_results(&[("b", 10.0), ("a", 2.0)]);
 
         // Equal weights
-        let fused = linear_combination(&[ranking1, ranking2], &[0.5, 0.5]);
+        let fused = weighted_fusion(&bm25, &semantic, 0.5);
 
-        // "a" gets 0.5 * 1.0 + 0.5 * 0.0 = 0.5
-        // "b" gets 0.5 * 0.0 + 0.5 * 1.0 = 0.5 (after normalization)
-        // Actually with normalization:
-        // ranking1: a=1.0 normalized to 1.0, b=0.5 normalized to 0.0 (since min=0.5, max=1.0, range=0.5)
-        // Wait, let me recalculate...
+        // Both should have scores
+        assert_eq!(fused.len(), 2);
 
-        assert!(fused.len() == 2);
+        // "a" has normalized BM25=1.0 (max), semantic=0.0 (min) -> 0.5*1.0 + 0.5*0.0 = 0.5
+        // "b" has normalized BM25=0.0 (min), semantic=1.0 (max) -> 0.5*0.0 + 0.5*1.0 = 0.5
+        let a_score = fused.iter().find(|r| r.doc_id == "a").unwrap().score;
+        let b_score = fused.iter().find(|r| r.doc_id == "b").unwrap().score;
+        assert!((a_score - b_score).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_weighted_fusion_bm25_bias() {
+        let bm25 = make_results(&[("a", 10.0), ("b", 5.0)]);
+        let semantic = make_results(&[("b", 10.0), ("a", 2.0)]);
+
+        // Heavy BM25 weight
+        let fused = weighted_fusion(&bm25, &semantic, 0.8);
+
+        // "a" should win with BM25 bias
+        assert_eq!(fused[0].doc_id, "a");
+    }
+
+    #[test]
+    fn test_aggregate_chunks() {
+        let chunks = make_results(&[
+            ("file1.rs#chunk0", 0.8),
+            ("file1.rs#chunk1", 0.9), // Best chunk for file1
+            ("file2.rs#chunk0", 0.7),
+        ]);
+
+        let files = aggregate_chunks_to_files(&chunks);
+
+        assert_eq!(files.len(), 2);
+        // file1 should have score 0.9 (max of its chunks)
+        let f1 = files.iter().find(|r| r.doc_id == "file1.rs").unwrap();
+        assert!((f1.score - 0.9).abs() < 1e-6);
     }
 
     #[test]
@@ -147,7 +240,7 @@ mod tests {
         let fused = reciprocal_rank_fusion(&[]);
         assert!(fused.is_empty());
 
-        let fused = linear_combination(&[], &[]);
+        let fused = weighted_fusion(&[], &[], 0.5);
         assert!(fused.is_empty());
     }
 }

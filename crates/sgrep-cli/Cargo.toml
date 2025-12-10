@@ -16,6 +16,7 @@ sgrep-cas.workspace = true
 sgrep-index.workspace = true
 sgrep-fusion.workspace = true
 sgrep-candle.workspace = true
+sgrep-chunk.workspace = true
 eyre.workspace = true
 color-eyre.workspace = true
 serde.workspace = true

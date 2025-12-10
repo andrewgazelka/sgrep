@@ -127,12 +127,14 @@ fn create_walker(path: &std::path::Path) -> eyre::Result<ignore::Walk> {
     Ok(builder.build())
 }
 
-/// Build a mapping from doc_id to content hash for semantic search.
-fn build_doc_hash_map(
+/// Build a mapping from chunk_id to content hash for semantic search.
+/// This walks all files and chunks them to find which chunk IDs have embeddings.
+fn build_chunk_hash_map(
     store: &sgrep_cas::EmbeddingStore,
     path: &std::path::Path,
 ) -> eyre::Result<std::collections::HashMap<String, sgrep_cas::ContentHash>> {
     let mut map = std::collections::HashMap::new();
+    let chunk_config = sgrep_chunk::ChunkConfig::default();
 
     let walker = create_walker(path)?;
 
@@ -149,14 +151,27 @@ fn build_doc_hash_map(
             Err(_) => continue,
         };
 
-        let hash = sgrep_cas::ContentHash::from_content(&content);
-        if store.has_embeddings(&hash) {
-            let relative_path = file_path
-                .strip_prefix(path)
-                .unwrap_or(file_path)
-                .to_string_lossy()
-                .to_string();
-            map.insert(relative_path, hash);
+        let content_str = match std::str::from_utf8(&content) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        let relative_path = file_path
+            .strip_prefix(path)
+            .unwrap_or(file_path)
+            .to_string_lossy()
+            .to_string();
+
+        let chunks = sgrep_chunk::chunk_text(content_str, chunk_config);
+
+        for (chunk_idx, chunk) in chunks.iter().enumerate() {
+            let chunk_id = sgrep_chunk::chunk_id(&relative_path, chunk_idx);
+            let formatted = format_for_indexing(&chunk_id, chunk.content);
+            let hash = sgrep_cas::ContentHash::from_content(formatted.as_bytes());
+
+            if store.has_embeddings(&hash) {
+                map.insert(chunk_id, hash);
+            }
         }
     }
 
@@ -188,26 +203,29 @@ fn search(
         );
     }
 
-    // BM25 search
+    // BM25 search - results are now chunk IDs
     let bm25_path = index_path.join(BM25_DIR);
     let bm25_index =
         sgrep_index::Bm25Index::new_at_path(&bm25_path).wrap_err("failed to open BM25 index")?;
 
-    // Get more results for fusion (we'll re-rank)
-    let fetch_limit = limit * 3;
-    let bm25_results = bm25_index
+    // Get more chunk results for fusion (we'll aggregate to files and re-rank)
+    let fetch_limit = limit * 10; // More chunks since we aggregate to files
+    let bm25_chunk_results = bm25_index
         .search(query, fetch_limit)
         .wrap_err("BM25 search failed")?;
 
-    // Build BM25 score map
-    let bm25_scores: std::collections::HashMap<String, f32> = bm25_results
+    // Aggregate BM25 chunk results to file-level scores
+    let bm25_file_results = sgrep_fusion::aggregate_chunks_to_files(&bm25_chunk_results);
+
+    // Build file-level BM25 score map
+    let bm25_scores: std::collections::HashMap<String, f32> = bm25_file_results
         .iter()
         .map(|r| (r.doc_id.clone(), r.score))
         .collect();
 
-    if bm25_only || bm25_results.is_empty() {
+    if bm25_only || bm25_file_results.is_empty() {
         if json {
-            let results: Vec<JsonResult> = bm25_results
+            let results: Vec<JsonResult> = bm25_file_results
                 .iter()
                 .take(limit)
                 .map(|r| JsonResult {
@@ -222,7 +240,7 @@ fn search(
                 serde_json::to_string_pretty(&results).wrap_err("failed to serialize JSON")?
             );
         } else {
-            for result in bm25_results.iter().take(limit) {
+            for result in bm25_file_results.iter().take(limit) {
                 println!("{}: {:.4}", result.doc_id, result.score);
             }
         }
@@ -234,14 +252,15 @@ fn search(
     let mut store = sgrep_cas::EmbeddingStore::open(embeddings_path)
         .wrap_err("failed to open embedding store")?;
 
-    // Build doc_id -> hash mapping
-    let doc_hash_map = build_doc_hash_map(&store, path).wrap_err("failed to build doc hash map")?;
+    // Build chunk_id -> hash mapping
+    let chunk_hash_map =
+        build_chunk_hash_map(&store, path).wrap_err("failed to build chunk hash map")?;
 
-    if doc_hash_map.is_empty() {
+    if chunk_hash_map.is_empty() {
         // No embeddings, fall back to BM25 only
         eprintln!("Warning: no embeddings found, using BM25 only");
         if json {
-            let results: Vec<JsonResult> = bm25_results
+            let results: Vec<JsonResult> = bm25_file_results
                 .iter()
                 .take(limit)
                 .map(|r| JsonResult {
@@ -256,7 +275,7 @@ fn search(
                 serde_json::to_string_pretty(&results).wrap_err("failed to serialize JSON")?
             );
         } else {
-            for result in bm25_results.iter().take(limit) {
+            for result in bm25_file_results.iter().take(limit) {
                 println!("{}: {:.4}", result.doc_id, result.score);
             }
         }
@@ -269,14 +288,15 @@ fn search(
         .encode_query(query)
         .wrap_err("failed to encode query")?;
 
-    // Collect document embeddings for batch processing
-    let mut doc_ids = Vec::new();
-    let mut doc_hashes = Vec::new();
+    // Collect chunk embeddings for batch processing
+    // Use the chunks from BM25 results that have embeddings
+    let mut chunk_ids = Vec::new();
+    let mut chunk_hashes = Vec::new();
 
-    for bm25_result in &bm25_results {
-        if let Some(hash) = doc_hash_map.get(&bm25_result.doc_id) {
-            doc_ids.push(bm25_result.doc_id.clone());
-            doc_hashes.push(hash);
+    for bm25_result in &bm25_chunk_results {
+        if let Some(hash) = chunk_hash_map.get(&bm25_result.doc_id) {
+            chunk_ids.push(bm25_result.doc_id.clone());
+            chunk_hashes.push(hash);
         }
     }
 
@@ -284,38 +304,48 @@ fn search(
     let gpu = sgrep_embed::GpuDevice::new().wrap_err("failed to create GPU device")?;
 
     let batch_views = store
-        .get_batch_views(&doc_hashes)
+        .get_batch_views(&chunk_hashes)
         .wrap_err("failed to get batch views")?;
 
     // Extract just the views for batch processing
-    let doc_views: Vec<_> = batch_views.iter().map(|(_, v)| *v).collect();
+    let chunk_views: Vec<_> = batch_views.iter().map(|(_, v)| *v).collect();
 
     let colbert_scores_vec = gpu
-        .batch_maxsim(query_embedding.view(), &doc_views)
+        .batch_maxsim(query_embedding.view(), &chunk_views)
         .wrap_err("failed to compute batch MaxSim")?;
 
-    // Build score maps
-    let mut colbert_scores: std::collections::HashMap<String, f32> =
-        std::collections::HashMap::new();
-    let mut semantic_results = Vec::new();
+    // Build chunk-level semantic results
+    let mut semantic_chunk_results = Vec::new();
 
     for (i, (hash, _)) in batch_views.iter().enumerate() {
-        // Find doc_id for this hash
-        let doc_id = doc_hashes
+        // Find chunk_id for this hash
+        let chunk_id = chunk_hashes
             .iter()
-            .zip(doc_ids.iter())
+            .zip(chunk_ids.iter())
             .find(|(h, _)| **h == hash)
             .map(|(_, id)| id.clone());
 
-        if let Some(doc_id) = doc_id {
+        if let Some(chunk_id) = chunk_id {
             let score = colbert_scores_vec[i];
-            colbert_scores.insert(doc_id.clone(), score);
-            semantic_results.push(sgrep_core::SearchResult { doc_id, score });
+            semantic_chunk_results.push(sgrep_core::SearchResult {
+                doc_id: chunk_id,
+                score,
+            });
         }
     }
 
-    // Fuse results using RRF
-    let fused = sgrep_fusion::reciprocal_rank_fusion(&[bm25_results, semantic_results]);
+    // Aggregate semantic chunk results to file-level scores
+    let semantic_file_results = sgrep_fusion::aggregate_chunks_to_files(&semantic_chunk_results);
+
+    // Build file-level ColBERT score map
+    let colbert_scores: std::collections::HashMap<String, f32> = semantic_file_results
+        .iter()
+        .map(|r| (r.doc_id.clone(), r.score))
+        .collect();
+
+    // Fuse file-level results using weighted fusion (more mathematically sound than RRF)
+    // BM25 weight of 0.3 gives slight preference to semantic search for code
+    let fused = sgrep_fusion::weighted_fusion(&bm25_file_results, &semantic_file_results, 0.3);
 
     if json {
         let results: Vec<JsonResult> = fused
@@ -345,6 +375,18 @@ fn search(
 struct IndexableFile {
     relative_path: String,
     content_bytes: Vec<u8>,
+}
+
+/// A chunk of a file ready for indexing.
+struct IndexableChunk {
+    /// Chunk ID in format "file_path#chunkN"
+    chunk_id: String,
+    /// The file this chunk belongs to
+    file_path: String,
+    /// Formatted content with path header
+    formatted_content: String,
+    /// Content hash for the chunk
+    hash: sgrep_cas::ContentHash,
 }
 
 /// Format content with file path header for indexing.
@@ -456,64 +498,79 @@ fn index(path: &std::path::Path) -> eyre::Result<()> {
     let mut store = sgrep_cas::EmbeddingStore::open(embeddings_path.clone())
         .wrap_err_with(|| format!("failed to create embedding store at {embeddings_path:?}"))?;
 
-    // Phase 4: Prepare file data and check embedding cache
-    struct FileToEmbed {
-        path: String,
-        formatted_content: String,
-        hash: sgrep_cas::ContentHash,
-    }
-
-    let mut files_to_embed: Vec<FileToEmbed> = Vec::new();
+    // Phase 4: Chunk files and prepare for indexing
+    let chunk_config = sgrep_chunk::ChunkConfig::default();
+    let mut all_chunks: Vec<IndexableChunk> = Vec::new();
     let mut cached_count = 0_u64;
 
-    // Prepare documents for BM25 and check embedding cache
-    let bm25_docs: Vec<_> = files
-        .iter()
-        .map(|file| {
-            let content_str =
-                std::str::from_utf8(&file.content_bytes).expect("already verified as UTF-8");
-            let formatted = format_for_indexing(&file.relative_path, content_str);
+    for file in &files {
+        let content_str =
+            std::str::from_utf8(&file.content_bytes).expect("already verified as UTF-8");
 
-            // Check if embedding is cached
-            let hash = sgrep_cas::ContentHash::from_content(&file.content_bytes);
+        let chunks = sgrep_chunk::chunk_text(content_str, chunk_config);
+
+        for (chunk_idx, chunk) in chunks.iter().enumerate() {
+            let chunk_id = sgrep_chunk::chunk_id(&file.relative_path, chunk_idx);
+            let formatted = format_for_indexing(&chunk_id, chunk.content);
+            let hash = sgrep_cas::ContentHash::from_content(formatted.as_bytes());
+
             if store.has_embeddings(&hash) {
                 cached_count += 1;
-            } else {
-                files_to_embed.push(FileToEmbed {
-                    path: file.relative_path.clone(),
-                    formatted_content: formatted.clone(),
-                    hash,
-                });
             }
 
-            (file.relative_path.clone(), formatted)
-        })
+            all_chunks.push(IndexableChunk {
+                chunk_id,
+                file_path: file.relative_path.clone(),
+                formatted_content: formatted,
+                hash,
+            });
+        }
+    }
+
+    // Prepare BM25 documents from chunks
+    let bm25_docs: Vec<_> = all_chunks
+        .iter()
+        .map(|chunk| (chunk.chunk_id.clone(), chunk.formatted_content.clone()))
         .collect();
 
     // BM25 indexing - single batch commit (much faster than per-document)
     let bm25_spinner = ProgressBar::new_spinner();
     bm25_spinner.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg}")?);
-    bm25_spinner.set_message(format!("Indexing {} files for BM25...", bm25_docs.len()));
+    bm25_spinner.set_message(format!(
+        "Indexing {} chunks from {} files for BM25...",
+        bm25_docs.len(),
+        files.len()
+    ));
     bm25_spinner.enable_steady_tick(std::time::Duration::from_millis(100));
 
     bm25_index
         .add_documents(bm25_docs.iter().map(|(p, c)| (p.as_str(), c.as_str())))
         .wrap_err("failed to add documents to BM25 index")?;
 
-    bm25_spinner.finish_with_message(format!("BM25 index: {} files", files.len()));
+    bm25_spinner.finish_with_message(format!(
+        "BM25 index: {} chunks from {} files",
+        all_chunks.len(),
+        files.len()
+    ));
 
     // Phase 5: Batched GPU embedding
     let mut embedded_count = 0_u64;
     let mut encode_errors = 0_u64;
     let start_time = std::time::Instant::now();
 
-    if !files_to_embed.is_empty() {
-        // Dynamic batching: pack files by estimated token count
+    // Filter to only chunks that need embedding
+    let chunks_to_embed: Vec<_> = all_chunks
+        .iter()
+        .filter(|chunk| !store.has_embeddings(&chunk.hash))
+        .collect();
+
+    if !chunks_to_embed.is_empty() {
+        // Dynamic batching: pack chunks by estimated token count
         const MAX_BATCH_FILES: usize = 64;
         const MAX_BATCH_TOKENS: usize = 8192;
         const CHARS_PER_TOKEN: usize = 4; // rough estimate
 
-        let embed_progress = ProgressBar::new(files_to_embed.len() as u64);
+        let embed_progress = ProgressBar::new(chunks_to_embed.len() as u64);
         embed_progress.set_style(
             ProgressStyle::default_bar()
                 .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}) Embedding: {msg}")
@@ -522,16 +579,16 @@ fn index(path: &std::path::Path) -> eyre::Result<()> {
         );
 
         let mut batch_start = 0;
-        while batch_start < files_to_embed.len() {
+        while batch_start < chunks_to_embed.len() {
             // Build batch dynamically based on estimated token count
             let mut batch_end = batch_start;
             let mut batch_tokens = 0;
 
-            while batch_end < files_to_embed.len() {
-                let file = &files_to_embed[batch_end];
-                let est_tokens = file.formatted_content.len() / CHARS_PER_TOKEN;
+            while batch_end < chunks_to_embed.len() {
+                let chunk = chunks_to_embed[batch_end];
+                let est_tokens = chunk.formatted_content.len() / CHARS_PER_TOKEN;
 
-                // Stop if adding this file would exceed limits (unless batch is empty)
+                // Stop if adding this chunk would exceed limits (unless batch is empty)
                 if batch_end > batch_start
                     && (batch_end - batch_start >= MAX_BATCH_FILES
                         || batch_tokens + est_tokens > MAX_BATCH_TOKENS)
@@ -543,43 +600,43 @@ fn index(path: &std::path::Path) -> eyre::Result<()> {
                 batch_end += 1;
             }
 
-            let chunk = &files_to_embed[batch_start..batch_end];
-            let texts: Vec<&str> = chunk.iter().map(|f| f.formatted_content.as_str()).collect();
+            let batch = &chunks_to_embed[batch_start..batch_end];
+            let texts: Vec<&str> = batch.iter().map(|c| c.formatted_content.as_str()).collect();
 
             // Show batch info
-            if let Some(first) = chunk.first() {
+            if let Some(first) = batch.first() {
                 embed_progress
-                    .set_message(format!("{} (+{}, ~{}tok)", first.path, chunk.len().saturating_sub(1), batch_tokens));
+                    .set_message(format!("{} (+{}, ~{}tok)", first.chunk_id, batch.len().saturating_sub(1), batch_tokens));
             }
 
             match encoder.encode_documents_batch(&texts) {
                 Ok(embeddings) => {
-                    for (file, embedding) in chunk.iter().zip(embeddings.into_iter()) {
+                    for (chunk, embedding) in batch.iter().zip(embeddings.into_iter()) {
                         store
-                            .store_embeddings(&file.hash, embedding.view())
-                            .wrap_err_with(|| format!("failed to store embeddings for {}", file.path))?;
+                            .store_embeddings(&chunk.hash, embedding.view())
+                            .wrap_err_with(|| format!("failed to store embeddings for {}", chunk.chunk_id))?;
                         embedded_count += 1;
                     }
                 }
                 Err(e) => {
-                    // Batch failed, try individually to isolate bad files
+                    // Batch failed, try individually to isolate bad chunks
                     tracing::warn!(?e, "batch encoding failed, falling back to individual encoding");
-                    for file in chunk {
-                        match encoder.encode_document(&file.formatted_content) {
+                    for chunk in batch {
+                        match encoder.encode_document(&chunk.formatted_content) {
                             Ok(embedding) => {
-                                store.store_embeddings(&file.hash, embedding.view())?;
+                                store.store_embeddings(&chunk.hash, embedding.view())?;
                                 embedded_count += 1;
                             }
                             Err(e) => {
                                 encode_errors += 1;
-                                tracing::warn!(path = %file.path, ?e, "failed to encode document");
+                                tracing::warn!(path = %chunk.chunk_id, ?e, "failed to encode chunk");
                             }
                         }
                     }
                 }
             }
 
-            embed_progress.inc(chunk.len() as u64);
+            embed_progress.inc(batch.len() as u64);
             batch_start = batch_end;
         }
         embed_progress.finish_and_clear();
@@ -588,8 +645,9 @@ fn index(path: &std::path::Path) -> eyre::Result<()> {
     let elapsed = start_time.elapsed();
 
     // Final summary
-    let total_files = files.len() as u64;
-    println!("Indexed {total_files} files");
+    let total_files = files.len();
+    let total_chunks = all_chunks.len();
+    println!("Indexed {total_files} files ({total_chunks} chunks)");
 
     if embedded_count > 0 {
         let embed_per_sec = embedded_count as f64 / elapsed.as_secs_f64();

@@ -3224,6 +3224,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "sgrep-chunk"
+version = "0.1.0"
+
+[[package]]
 name = "sgrep-cli"
 version = "0.1.0"
 dependencies = [
@@ -3238,6 +3242,7 @@ dependencies = [
  "serde_json",
  "sgrep-candle",
  "sgrep-cas",
+ "sgrep-chunk",
  "sgrep-core",
  "sgrep-embed",
  "sgrep-fusion",
@@ -3274,9 +3279,8 @@ name = "sgrep-fusion"
 version = "0.1.0"
 dependencies = [
  "eyre",
+ "sgrep-chunk",
  "sgrep-core",
- "sgrep-embed",
- "sgrep-index",
  "tracing",
 ]
 

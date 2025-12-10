@@ -23,6 +23,7 @@ sgrep-index = { path = "crates/sgrep/index" }
 sgrep-fusion = { path = "crates/sgrep/fusion" }
 sgrep-inference = { path = "crates/sgrep/inference" }
 sgrep-candle = { path = "crates/sgrep/candle" }
+sgrep-chunk = { path = "crates/sgrep/chunk" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

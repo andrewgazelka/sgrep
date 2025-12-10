@@ -7,8 +7,7 @@ description = "Rank fusion combining BM25 and embedding scores"
 
 [dependencies]
 sgrep-core.workspace = true
-sgrep-embed.workspace = true
-sgrep-index.workspace = true
+sgrep-chunk.workspace = true
 eyre.workspace = true
 tracing.workspace = true
 
