@@ -344,3 +344,297 @@ pub fn default_device() -> eyre::Result<candle_core::Device> {
 pub fn cpu_device() -> candle_core::Device {
     candle_core::Device::Cpu
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper to load encoder from HuggingFace Hub for tests.
+    fn load_test_encoder() -> eyre::Result<ColBertEncoder> {
+        use hf_hub::api::sync::Api;
+
+        let api = Api::new()?;
+        let repo = api.model("jinaai/jina-colbert-v2".to_string());
+
+        let model_path = repo.get("model.safetensors")?;
+        let tokenizer_path = repo.get("tokenizer.json")?;
+        let config_path = repo.get("config.json")?;
+
+        ColBertEncoder::load(&model_path, &tokenizer_path, &config_path)
+    }
+
+    #[test]
+    fn test_single_encode_correctness() -> eyre::Result<()> {
+        let mut encoder = load_test_encoder()?;
+
+        let embedding = encoder.encode_document("fn main() { println!(\"hello\"); }")?;
+
+        // Should have reasonable token count (CLS + marker + tokens)
+        assert!(embedding.nrows() >= 3, "too few tokens: {}", embedding.nrows());
+        assert!(embedding.nrows() <= MAX_SEQ_LENGTH, "too many tokens");
+
+        // Should be normalized (L2 norm ≈ 1 for each row)
+        for row in embedding.rows() {
+            let norm: f32 = row.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!(
+                (norm - 1.0).abs() < 0.01,
+                "embedding not normalized: norm = {norm}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_batch_encode_matches_single() -> eyre::Result<()> {
+        let mut encoder = load_test_encoder()?;
+
+        let texts = &[
+            "fn main() {}",
+            "let x = 42;",
+            "struct Foo { bar: i32 }",
+        ];
+
+        // Encode individually
+        let single_results: Vec<_> = texts
+            .iter()
+            .map(|t| encoder.encode_document(t))
+            .collect::<eyre::Result<Vec<_>>>()?;
+
+        // Encode as batch
+        let batch_results = encoder.encode_documents_batch(texts)?;
+
+        assert_eq!(single_results.len(), batch_results.len());
+
+        // Compare embeddings (should be identical)
+        for (single, batch) in single_results.iter().zip(batch_results.iter()) {
+            assert_eq!(single.shape(), batch.shape(), "shape mismatch");
+
+            // Check values match within floating point tolerance
+            for (s, b) in single.iter().zip(batch.iter()) {
+                assert!(
+                    (s - b).abs() < 1e-5,
+                    "value mismatch: single={s}, batch={b}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_query_vs_document_markers() -> eyre::Result<()> {
+        let mut encoder = load_test_encoder()?;
+
+        let text = "hello world";
+        let query_emb = encoder.encode_query(text)?;
+        let doc_emb = encoder.encode_document(text)?;
+
+        // Same text should produce same shape
+        assert_eq!(query_emb.shape(), doc_emb.shape());
+
+        // But different embeddings (due to different marker tokens)
+        let mut any_different = false;
+        for (q, d) in query_emb.iter().zip(doc_emb.iter()) {
+            if (q - d).abs() > 1e-5 {
+                any_different = true;
+                break;
+            }
+        }
+        assert!(any_different, "query and document embeddings should differ");
+
+        Ok(())
+    }
+
+    /// Compute cosine similarity via MaxSim (ColBERT late interaction).
+    fn maxsim(query: &ndarray::Array2<f32>, doc: &ndarray::Array2<f32>) -> f32 {
+        let mut total = 0.0_f32;
+        for q_row in query.rows() {
+            let mut max_sim = f32::NEG_INFINITY;
+            for d_row in doc.rows() {
+                let sim: f32 = q_row.iter().zip(d_row.iter()).map(|(a, b)| a * b).sum();
+                if sim > max_sim {
+                    max_sim = sim;
+                }
+            }
+            total += max_sim;
+        }
+        total / query.nrows() as f32
+    }
+
+    /// Semantic quality test: related code should score higher than unrelated.
+    #[test]
+    fn test_semantic_similarity_ranking() -> eyre::Result<()> {
+        let mut encoder = load_test_encoder()?;
+
+        // Query about error handling
+        let query = encoder.encode_query("error handling try catch")?;
+
+        // Related: actual error handling code
+        let related = encoder.encode_document(
+            r#"try {
+                doSomething();
+            } catch (error) {
+                console.error("Failed:", error);
+                throw error;
+            }"#,
+        )?;
+
+        // Unrelated: completely different topic
+        let unrelated = encoder.encode_document(
+            r#"const colors = ["red", "green", "blue"];
+            for (const color of colors) {
+                console.log(color);
+            }"#,
+        )?;
+
+        let related_score = maxsim(&query, &related);
+        let unrelated_score = maxsim(&query, &unrelated);
+
+        eprintln!("Query: 'error handling try catch'");
+        eprintln!("  Related score: {related_score:.4}");
+        eprintln!("  Unrelated score: {unrelated_score:.4}");
+
+        assert!(
+            related_score > unrelated_score,
+            "related code should score higher: related={related_score:.4} <= unrelated={unrelated_score:.4}"
+        );
+
+        // The margin should be meaningful (not just barely higher)
+        let margin = related_score - unrelated_score;
+        assert!(
+            margin > 0.05,
+            "margin too small: {margin:.4} (expected > 0.05)"
+        );
+
+        Ok(())
+    }
+
+    /// Semantic quality test: same concept in different languages should be similar.
+    #[test]
+    fn test_cross_language_similarity() -> eyre::Result<()> {
+        let mut encoder = load_test_encoder()?;
+
+        let query = encoder.encode_query("function that adds two numbers")?;
+
+        let rust_code = encoder.encode_document("fn add(a: i32, b: i32) -> i32 { a + b }")?;
+        let python_code = encoder.encode_document("def add(a, b):\n    return a + b")?;
+        let js_code = encoder.encode_document("function add(a, b) { return a + b; }")?;
+
+        // Unrelated code
+        let unrelated = encoder.encode_document("SELECT * FROM users WHERE active = true")?;
+
+        let rust_score = maxsim(&query, &rust_code);
+        let python_score = maxsim(&query, &python_code);
+        let js_score = maxsim(&query, &js_code);
+        let unrelated_score = maxsim(&query, &unrelated);
+
+        eprintln!("Query: 'function that adds two numbers'");
+        eprintln!("  Rust: {rust_score:.4}");
+        eprintln!("  Python: {python_score:.4}");
+        eprintln!("  JavaScript: {js_score:.4}");
+        eprintln!("  SQL (unrelated): {unrelated_score:.4}");
+
+        // All implementations should score higher than unrelated
+        assert!(rust_score > unrelated_score, "Rust should beat unrelated");
+        assert!(python_score > unrelated_score, "Python should beat unrelated");
+        assert!(js_score > unrelated_score, "JS should beat unrelated");
+
+        Ok(())
+    }
+
+    /// Semantic quality test: specific function names should match.
+    #[test]
+    fn test_function_name_matching() -> eyre::Result<()> {
+        let mut encoder = load_test_encoder()?;
+
+        let query = encoder.encode_query("parseJSON")?;
+
+        let matching = encoder.encode_document(
+            r#"pub fn parse_json(input: &str) -> Result<Value, Error> {
+                serde_json::from_str(input)
+            }"#,
+        )?;
+
+        let similar_topic = encoder.encode_document(
+            r#"pub fn to_xml(value: &Value) -> String {
+                serialize_to_xml(value)
+            }"#,
+        )?;
+
+        let unrelated = encoder.encode_document(
+            r#"pub fn calculate_distance(a: Point, b: Point) -> f64 {
+                ((b.x - a.x).powi(2) + (b.y - a.y).powi(2)).sqrt()
+            }"#,
+        )?;
+
+        let matching_score = maxsim(&query, &matching);
+        let similar_score = maxsim(&query, &similar_topic);
+        let unrelated_score = maxsim(&query, &unrelated);
+
+        eprintln!("Query: 'parseJSON'");
+        eprintln!("  parse_json function: {matching_score:.4}");
+        eprintln!("  to_xml (similar topic): {similar_score:.4}");
+        eprintln!("  calculate_distance: {unrelated_score:.4}");
+
+        // Exact match should be best
+        assert!(
+            matching_score > similar_score,
+            "exact match should beat similar topic"
+        );
+        assert!(
+            matching_score > unrelated_score,
+            "exact match should beat unrelated"
+        );
+
+        Ok(())
+    }
+
+    /// Regression test: embeddings should have consistent magnitude.
+    #[test]
+    fn test_embedding_consistency() -> eyre::Result<()> {
+        let mut encoder = load_test_encoder()?;
+
+        // Encode same text multiple times
+        let text = "fn main() { println!(\"hello\"); }";
+        let emb1 = encoder.encode_document(text)?;
+        let emb2 = encoder.encode_document(text)?;
+
+        // Should be identical
+        assert_eq!(emb1.shape(), emb2.shape());
+        for (a, b) in emb1.iter().zip(emb2.iter()) {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "embeddings not deterministic: {a} != {b}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_empty_batch() -> eyre::Result<()> {
+        let mut encoder = load_test_encoder()?;
+        let result = encoder.encode_documents_batch(&[])?;
+        assert!(result.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn test_long_document_truncation() -> eyre::Result<()> {
+        let mut encoder = load_test_encoder()?;
+
+        // Create a very long document
+        let long_text = "word ".repeat(1000);
+        let embedding = encoder.encode_document(&long_text)?;
+
+        // Should be truncated to MAX_SEQ_LENGTH
+        assert!(
+            embedding.nrows() <= MAX_SEQ_LENGTH,
+            "should truncate: got {} rows",
+            embedding.nrows()
+        );
+
+        Ok(())
+    }
+}
